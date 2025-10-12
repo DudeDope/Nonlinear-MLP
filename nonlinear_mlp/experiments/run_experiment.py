@@ -72,6 +72,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, help="Path to JSON config (optional)")
     parser.add_argument("--dataset", type=str, default="mnist")
+    parser.add_argument("--model", type=str, default="mlp")  # ADDED
     parser.add_argument("--approach", type=str, default="fixed")
     parser.add_argument("--linear_ratio", type=float, default=0.5)
     parser.add_argument("--pattern", type=str, default="structured")
@@ -85,9 +86,15 @@ def main():
         with open(args.config) as f:
             cfg_dict = json.load(f)
         cfg = ExperimentConfig(**cfg_dict)
+        # Allow CLI override of run_name and model if provided
+        if args.run_name:
+            cfg.logging.run_name = args.run_name
+        if args.model:
+            cfg.model = args.model
     else:
         cfg = ExperimentConfig()
         cfg.dataset = args.dataset
+        cfg.model = args.model                 # ADDED
         cfg.approach = "gating" if args.gating else args.approach
         cfg.fixed.linear_ratio = args.linear_ratio
         cfg.fixed.pattern = args.pattern
