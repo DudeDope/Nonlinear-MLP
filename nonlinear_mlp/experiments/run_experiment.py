@@ -72,7 +72,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, help="Path to JSON config (optional)")
     parser.add_argument("--dataset", type=str, default="mnist")
-    parser.add_argument("--model", type=str, default="mlp")  # ADDED
+    parser.add_argument("--model", type=str, default="mlp")
     parser.add_argument("--approach", type=str, default="fixed")
     parser.add_argument("--linear_ratio", type=float, default=0.5)
     parser.add_argument("--pattern", type=str, default="structured")
@@ -108,9 +108,17 @@ def main():
     train_loader, test_loader, input_dim, num_classes = get_data(cfg)
     model = build_model(cfg, input_dim=input_dim, num_classes=num_classes).to(device)
 
-    optim = torch.optim.AdamW(model.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay)
-    scaler = torch.cuda.amp.GradScaler() if (device.startswith("cuda") and cfg.training.amp) else None
+    optim = torch.optim.AdamW(
+        model.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay
+    )
 
+    # Modern GradScaler; fall back if not available
+    try:
+        scaler = torch.amp.GradScaler("cuda") if (device.startswith("cuda") and cfg.training.amp) else None
+    except Exception:
+        # Back-compat (will print deprecation warning on newer PyTorch)
+        from torch.cuda.amp import GradScaler as _LegacyGradScaler
+        scaler = _LegacyGradScaler() if (device.startswith("cuda") and cfg.training.amp) else None
     meta = {
         "param_counts": count_params(model),
         "approx_linear_flops": model_linear_flops(model),
