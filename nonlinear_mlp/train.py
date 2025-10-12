@@ -10,15 +10,10 @@ from typing import Dict, Any
 from torch import amp  # modern AMP API
 
 def compute_regularization(model, cfg, device):
-    """
-    Always return a 0-dim torch.Tensor on the right device to avoid
-    .item() errors when no regularization is used.
-    """
+    # Always return a 0-dim tensor on the correct device
     reg_loss = torch.zeros((), device=device)
-
     if cfg.approach == "gating":
         for layer in model.feature_layers:
-            # layer.alpha() returns a tensor on whatever device the layer lives on
             a = layer.alpha()
             if cfg.gating.entropy_reg > 0:
                 entropy = - (a * torch.log(a + 1e-8) + (1 - a) * torch.log(1 - a + 1e-8))
@@ -30,7 +25,6 @@ def compute_regularization(model, cfg, device):
             sparsity = (all_a < 0.5).float().mean()
             diff = sparsity - cfg.gating.sparsity_target
             reg_loss = reg_loss + cfg.gating.sparsity_loss_weight * diff.abs()
-
     return reg_loss
 
 def train_one_epoch(
@@ -55,11 +49,7 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        # Modern autocast
-        with amp.autocast(
-            device_type="cuda",
-            enabled=cfg.training.amp and device.startswith("cuda")
-        ):
+        with amp.autocast(device_type="cuda", enabled=cfg.training.amp and device.startswith("cuda")):
             logits = model(x)
             cls_loss = criterion(logits, y)
             reg_loss = compute_regularization(model, cfg, device)
@@ -81,7 +71,6 @@ def train_one_epoch(
         running["n"] += x.size(0)
 
         if (batch_idx + 1) % log_interval == 0:
-            # reg_loss is guaranteed a tensor; safe to .item()
             print(
                 f"Epoch {epoch} [{batch_idx+1}/{len(loader)}] "
                 f"Loss: {running['loss']/running['n']:.4f} "
@@ -114,7 +103,7 @@ def evaluate(model, loader, device, cfg):
         total_acc += acc1 * x.size(0)
         n += x.size(0)
     return {"val_loss": total_loss / n, "val_acc": total_acc / n}
-
+    
 def save_checkpoint(model, optimizer, cfg, epoch, metrics, path):
     os.makedirs(path, exist_ok=True)
     ckpt = {
