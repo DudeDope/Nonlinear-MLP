@@ -16,36 +16,46 @@ def accuracy(output, target, topk=(1,)):
             out.append((correct_k * (100.0 / batch_size)).item())
         return out
 
-def measure_inference_latency(model, dataloader, device, warmup=10, iters=50):
+def _prepare_for_model(model, x):
+    # Flatten images for MLPs (e.g., MNIST 1x28x28 -> 784)
+    if x.ndim == 4 and model.__class__.__name__ == "MLP":
+        x = x.view(x.size(0), -1)
+    return x
+
+def measure_inference_latency(model, dataloader, device, warmup=10, iters=50, sync_cuda=True):
     model.eval()
     times = []
-    import torch
+    measured_samples = 0
     with torch.no_grad():
         count = 0
-        for x, y in dataloader:
+        for x, _ in dataloader:
             x = x.to(device)
-            if x.ndim == 2:
-                pass
-            if device.startswith("cuda"):
+            x = _prepare_for_model(model, x)
+
+            if sync_cuda and device.startswith("cuda"):
                 torch.cuda.synchronize()
             start = time.perf_counter()
             _ = model(x)
-            if device.startswith("cuda"):
+            if sync_cuda and device.startswith("cuda"):
                 torch.cuda.synchronize()
             end = time.perf_counter()
+
             if count >= warmup:
                 times.append(end - start)
+                measured_samples += x.size(0)
             count += 1
             if count >= warmup + iters:
                 break
     if not times:
         return None
     import numpy as np
+    total_time = sum(times)
     return {
         "mean_latency_s": float(np.mean(times)),
         "p50_latency_s": float(np.percentile(times, 50)),
         "p90_latency_s": float(np.percentile(times, 90)),
-        "samples_per_second": float(len(dataloader.dataset) / sum(times)) if sum(times) > 0 else None
+        "samples_per_second": float(measured_samples / total_time) if total_time > 0 else None,
+        "batches_measured": len(times),
     }
 
 def memory_usage_mb():
