@@ -8,19 +8,19 @@ ActivationPattern = Literal["structured", "random", "alternating"]
 @dataclass
 class FixedRatioConfig:
     linear_ratio: float = 0.5
-    pattern: ActivationPattern = "structured"  # structured | random | alternating
-    per_layer: Optional[List[float]] = None  # overrides linear_ratio if provided
+    pattern: ActivationPattern = "structured"
+    per_layer: Optional[List[float]] = None
 
 @dataclass
 class GatingConfig:
     enabled: bool = False
-    init_alpha: float = 0.75          # initial alpha (prob of nonlinear)
+    init_alpha: float = 0.75
     temperature: float = 1.0
-    entropy_reg: float = 0.001        # encourages alpha -> {0,1}
-    l1_reg: float = 0.0               # pushes alpha toward 0 (less nonlinear)
+    entropy_reg: float = 0.001
+    l1_reg: float = 0.0
     sparsity_target: Optional[float] = None
     sparsity_loss_weight: float = 0.01
-    hard_threshold: float = 0.1       # after training alpha<th -> linear
+    hard_threshold: float = 0.1
     clamp: bool = True
 
 @dataclass
@@ -54,11 +54,20 @@ class LoggingConfig:
     save_checkpoints: bool = True
     output_dir: str = "runs"
     run_name: str = "exp"
+    # -------- W&B integration options --------
+    wandb_enabled: bool = False
+    wandb_project: Optional[str] = "nonlinear-mlp"
+    wandb_entity: Optional[str] = None
+    wandb_group: Optional[str] = None
+    wandb_tags: List[str] = field(default_factory=list)
+    wandb_mode: Optional[str] = None  # 'online' | 'offline' | 'disabled'
+    wandb_dir: Optional[str] = None   # default: runs/<run_name>/wandb
+    wandb_log_alpha_hist: bool = True # log alpha histograms per layer when gating
 
 @dataclass
 class ExperimentConfig:
-    dataset: str = "mnist"  # mnist | cifar10 | tabular_adult | tabular_credit | tabular_wine
-    model: str = "mlp"      # mlp | resnet18_head | tabular_mlp
+    dataset: str = "mnist"
+    model: str = "mlp"
     approach: Literal["fixed", "gating", "pruning", "mixed", "layerwise"] = "fixed"
     fixed: FixedRatioConfig = field(default_factory=FixedRatioConfig)
     gating: GatingConfig = field(default_factory=GatingConfig)
@@ -68,7 +77,7 @@ class ExperimentConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     hidden_dims: List[int] = field(default_factory=lambda: [512, 256, 128])
     num_classes: int = 10
-    input_dim: Optional[int] = None  # for tabular
+    input_dim: Optional[int] = None
     resume: Optional[str] = None
 
     def to_json(self):
