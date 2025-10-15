@@ -60,7 +60,7 @@ def main():
 
     # 1) MNIST Fixed ratios
     for ratio in [0.0, 0.25, 0.5, 0.75, 1.0]:
-        for pattern in ["structured", "random"]:
+        for pattern in ["structured"]:
             rn = f"mnist_fixed_{int(ratio*100)}_{pattern}"
             cfg = make_common_cfg("mnist", "mlp", "fixed", rn, epochs=args.epochs_mnist)
             cfg["fixed"] = {"linear_ratio": ratio, "pattern": pattern}
