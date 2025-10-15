@@ -69,6 +69,7 @@ def main():
             jobs.append([
                 "python", "-m", "nonlinear_mlp.experiments.run_experiment",
                 "--config", str(path),
+                "--wandb",  # enable W&B
                 "--wandb_project", args.project,
                 "--wandb_entity", args.entity or "",
                 "--wandb_mode", args.mode,
@@ -94,6 +95,7 @@ def main():
         jobs.append([
             "python", "-m", "nonlinear_mlp.experiments.run_experiment",
             "--config", str(path),
+            "--wandb",
             "--wandb_project", args.project,
             "--wandb_entity", args.entity or "",
             "--wandb_mode", args.mode,
@@ -117,6 +119,7 @@ def main():
         jobs.append([
             "python", "-m", "nonlinear_mlp.experiments.run_experiment",
             "--config", str(path),
+            "--wandb",
             "--wandb_project", args.project,
             "--wandb_entity", args.entity or "",
             "--wandb_mode", args.mode,
@@ -134,6 +137,7 @@ def main():
     jobs.append([
         "python", "-m", "nonlinear_mlp.experiments.run_experiment",
         "--config", str(path),
+        "--wandb",
         "--wandb_project", args.project,
         "--wandb_entity", args.entity or "",
         "--wandb_mode", args.mode,
@@ -151,6 +155,7 @@ def main():
         jobs.append([
             "python", "-m", "nonlinear_mlp.experiments.run_experiment",
             "--config", str(path),
+            "--wandb",
             "--wandb_project", args.project,
             "--wandb_entity", args.entity or "",
             "--wandb_mode", args.mode,
@@ -167,6 +172,7 @@ def main():
     jobs.append([
         "python", "-m", "nonlinear_mlp.experiments.run_experiment",
         "--config", str(path),
+        "--wandb",
         "--wandb_project", args.project,
         "--wandb_entity", args.entity or "",
         "--wandb_mode", args.mode,
@@ -184,6 +190,7 @@ def main():
     jobs.append([
         "python", "-m", "nonlinear_mlp.experiments.run_experiment",
         "--config", str(path),
+        "--wandb",
         "--wandb_project", args.project,
         "--wandb_entity", args.entity or "",
         "--wandb_mode", args.mode,
