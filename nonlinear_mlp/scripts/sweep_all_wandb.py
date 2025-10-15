@@ -1,208 +1,214 @@
+#!/usr/bin/env python
 """
-Sweep runner that launches multiple experiments and logs to Weights & Biases.
-Covers: Fixed ratios, Gating grid, Layerwise schedules, Pruning on MNIST and CIFAR-10 head.
+Simple sweep runner (idempotent) that mirrors the MNIST ratio loop
+and extends to CIFAR-10 head and Tabular Adult.
 
-Usage:
-  python scripts/sweep_all_wandb.py --project nonlinear-mlp --entity <wandb_user_or_team> --mode online
+Examples:
+  python nonlinear_mlp/scripts/simple_sweep.py --wandb_project nonlinear-mlp --mode online
+  python nonlinear_mlp/scripts/simple_sweep.py --include mnist_fixed,cifar_fixed --skip_existing  # default
+
+What it does:
+- MNIST MLP: fixed ratios, gating, pruning
+- CIFAR-10 ResNet-18 head: fixed ratios, gating, pruning
+- Tabular Adult MLP (optional): fixed + gating
+
+It skips any run whose runs/<run_name>/meta.json already exists.
 """
+
 import argparse
-import itertools
-import json
+import os
 import subprocess
-from pathlib import Path
 from datetime import datetime
 
+def run_once(run_name: str, cmd: list, skip_existing: bool = True) -> bool:
+    out_dir = os.path.join("runs", run_name)
+    meta_path = os.path.join(out_dir, "meta.json")
+    if skip_existing and os.path.exists(meta_path):
+        print(f"[SKIP] {run_name} (found {meta_path})")
+        return True
+    print("Running:", " ".join(str(x) for x in cmd))
+    try:
+        subprocess.run(cmd, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"[FAIL] {run_name} (exit={e.returncode})")
+        return False
 
-def run_cmd(cmd):
-    print("Running:", " ".join(str(c) for c in cmd))
-    subprocess.run(cmd, check=True)
-
-
-def write_config(path: Path, cfg: dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(cfg, f, indent=2)
-
-
-def make_common_cfg(dataset, model, approach, run_name, **kwargs):
-    cfg = {
-        "dataset": dataset,
-        "model": model,
-        "approach": approach,
-        "logging": {"run_name": run_name},
-        "training": {"epochs": kwargs.get("epochs", 20), "batch_size": kwargs.get("batch_size", 128)},
-    }
-    if model == "mlp":
-        cfg["hidden_dims"] = kwargs.get("hidden_dims", [512, 256, 128])
-        cfg["num_classes"] = kwargs.get("num_classes", 10)
-    elif model in ("resnet18_head", "resnet50_head"):
-        cfg["hidden_dims"] = kwargs.get("hidden_dims", [512, 256])
-        cfg["num_classes"] = kwargs.get("num_classes", 10)
-    return cfg
-
+def add_wandb_flags(cmd: list, project: str | None, mode: str, entity: str | None, group: str | None, tags: str | None, enable: bool) -> None:
+    if not enable or not project:
+        return
+    cmd.extend(["--wandb", "--wandb_project", project, "--wandb_mode", mode])
+    if entity:
+        cmd.extend(["--wandb_entity", entity])
+    if group:
+        cmd.extend(["--wandb_group", group])
+    if tags:
+        cmd.extend(["--wandb_tags", tags])
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--project", type=str, required=True, help="wandb project")
-    parser.add_argument("--entity", type=str, default=None, help="wandb entity (user/team)")
-    parser.add_argument("--mode", type=str, default="online", choices=["online", "offline", "disabled"])
-    parser.add_argument("--group", type=str, default=None)
-    parser.add_argument("--base_dir", type=str, default="tmp_sweep_configs")
+    parser.add_argument("--wandb_project", type=str, default=None, help="W&B project (enable logging if provided)")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="W&B entity (user/team)")
+    parser.add_argument("--mode", type=str, default="disabled", choices=["online", "offline", "disabled"], help="W&B mode")
+    parser.add_argument("--group", type=str, default=None, help="W&B group name")
+    parser.add_argument("--skip_existing", action="store_true", default=True, help="Skip runs with existing meta.json")
+    parser.add_argument("--include", type=str, default="mnist_fixed,mnist_gating,mnist_pruning,cifar_fixed,cifar_gating,cifar_pruning,adult_fixed,adult_gating",
+                        help="Comma list of jobs to include")
     parser.add_argument("--epochs_mnist", type=int, default=10)
     parser.add_argument("--epochs_cifar", type=int, default=60)
+    parser.add_argument("--epochs_adult", type=int, default=30)
     args = parser.parse_args()
 
-    base = Path(args.base_dir)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    group = args.group or f"sweep_{timestamp}"
+    group = args.group or f"simple_sweep_{timestamp}"
+    enable_wandb = args.wandb_project is not None and args.mode != "disabled"
 
-    jobs = []
+    # Base runner
+    base_cmd = ["python", "-m", "nonlinear_mlp.experiments.run_experiment"]
 
-    # 1) MNIST Fixed ratios
-    for ratio in [0.0, 0.25, 0.5, 0.75, 1.0]:
-        for pattern in ["structured"]:
-            rn = f"mnist_fixed_{int(ratio*100)}_{pattern}"
-            cfg = make_common_cfg("mnist", "mlp", "fixed", rn, epochs=args.epochs_mnist)
-            cfg["fixed"] = {"linear_ratio": ratio, "pattern": pattern}
-            path = base / f"{rn}.json"
-            write_config(path, cfg)
-            jobs.append([
-                "python", "-m", "nonlinear_mlp.experiments.run_experiment",
-                "--config", str(path),
-                "--wandb",  # enable W&B
-                "--wandb_project", args.project,
-                "--wandb_entity", args.entity or "",
-                "--wandb_mode", args.mode,
-                "--wandb_group", group,
-                "--wandb_tags", f"dataset:mnist,approach:fixed,pattern:{pattern}",
-            ])
+    # Parse which sets to include
+    include = {t.strip() for t in args.include.split(",") if t.strip()}
 
-    # 2) MNIST Gating grid
-    for init_alpha, entropy_reg, l1_reg in itertools.product([0.6, 0.8], [0.0, 0.002], [0.0, 0.01]):
-        rn = f"mnist_gating_a{int(100*init_alpha)}_ent{entropy_reg}_l1{l1_reg}"
-        cfg = make_common_cfg("mnist", "mlp", "gating", rn, epochs=args.epochs_mnist)
-        cfg["gating"] = {
-            "enabled": True,
-            "init_alpha": init_alpha,
-            "entropy_reg": entropy_reg,
-            "l1_reg": l1_reg,
-            "hard_threshold": 0.1,
-            "temperature": 1.0,
-            "clamp": True,
-        }
-        path = base / f"{rn}.json"
-        write_config(path, cfg)
-        jobs.append([
-            "python", "-m", "nonlinear_mlp.experiments.run_experiment",
-            "--config", str(path),
-            "--wandb",
-            "--wandb_project", args.project,
-            "--wandb_entity", args.entity or "",
-            "--wandb_mode", args.mode,
-            "--wandb_group", group,
-            "--wandb_tags", "dataset:mnist,approach:gating",
-        ])
+    failures = []
 
-    # 3) MNIST Layerwise schedules
-    layerwise_grid = [
-        [0.2, 0.5, 0.8],
-        [0.0, 0.5, 1.0],
-        [0.5, 0.5, 0.5],
-    ]
-    for ratios in layerwise_grid:
-        rn = "mnist_layerwise_" + "_".join(str(int(r * 100)) for r in ratios)
-        cfg = make_common_cfg("mnist", "mlp", "layerwise", rn, epochs=args.epochs_mnist)
-        cfg["fixed"] = {"linear_ratio": 0.5, "pattern": "structured", "per_layer": ratios}
-        cfg["layerwise"] = {"enabled": True, "schedule": {str(i): r for i, r in enumerate(ratios)}}
-        path = base / f"{rn}.json"
-        write_config(path, cfg)
-        jobs.append([
-            "python", "-m", "nonlinear_mlp.experiments.run_experiment",
-            "--config", str(path),
-            "--wandb",
-            "--wandb_project", args.project,
-            "--wandb_entity", args.entity or "",
-            "--wandb_mode", args.mode,
-            "--wandb_group", group,
-            "--wandb_tags", "dataset:mnist,approach:layerwise",
-        ])
+    # 1) MNIST MLP: fixed ratios
+    if "mnist_fixed" in include:
+        ratios = [0.0, 0.25, 0.5, 0.75, 1.0]
+        for r in ratios:
+            run_name = f"mnist_fixed_{int(r*100)}"
+            cmd = base_cmd + [
+                "--dataset", "mnist",
+                "--model", "mlp",
+                "--approach", "fixed",
+                "--linear_ratio", str(r),
+                "--pattern", "structured",
+                "--epochs", str(args.epochs_mnist),
+                "--run_name", run_name
+            ]
+            add_wandb_flags(cmd, args.wandb_project, args.mode, args.wandb_entity, group,
+                            f"dataset:mnist,approach:fixed,ratio:{r}", enable_wandb)
+            if not run_once(run_name, cmd, args.skip_existing):
+                failures.append(run_name)
 
-    # 4) MNIST Pruning from ReLU
-    rn = "mnist_prune_from_relu"
-    cfg = make_common_cfg("mnist", "mlp", "fixed", rn, epochs=args.epochs_mnist)
-    cfg["fixed"] = {"linear_ratio": 0.0, "pattern": "structured"}
-    cfg["pruning"] = {"enabled": True}
-    path = base / f"{rn}.json"
-    write_config(path, cfg)
-    jobs.append([
-        "python", "-m", "nonlinear_mlp.experiments.run_experiment",
-        "--config", str(path),
-        "--wandb",
-        "--wandb_project", args.project,
-        "--wandb_entity", args.entity or "",
-        "--wandb_mode", args.mode,
-        "--wandb_group", group,
-        "--wandb_tags", "dataset:mnist,approach:pruning",
-    ])
+    # 2) MNIST MLP: gating (single, simple)
+    if "mnist_gating" in include:
+        run_name = "mnist_gating"
+        cmd = base_cmd + [
+            "--dataset", "mnist",
+            "--model", "mlp",
+            "--gating",
+            "--epochs", str(args.epochs_mnist),
+            "--run_name", run_name
+        ]
+        add_wandb_flags(cmd, args.wandb_project, args.mode, args.wandb_entity, group,
+                        "dataset:mnist,approach:gating", enable_wandb)
+        if not run_once(run_name, cmd, args.skip_existing):
+            failures.append(run_name)
 
-    # 5) CIFAR-10 Fixed ratios on ResNet-18 head
-    for ratio in [0.25, 0.5, 0.75]:
-        rn = f"cifar_head_fixed_{int(100*ratio)}"
-        cfg = make_common_cfg("cifar10", "resnet18_head", "fixed", rn, epochs=args.epochs_cifar)
-        cfg["fixed"] = {"linear_ratio": ratio, "pattern": "structured"}
-        path = base / f"{rn}.json"
-        write_config(path, cfg)
-        jobs.append([
-            "python", "-m", "nonlinear_mlp.experiments.run_experiment",
-            "--config", str(path),
-            "--wandb",
-            "--wandb_project", args.project,
-            "--wandb_entity", args.entity or "",
-            "--wandb_mode", args.mode,
-            "--wandb_group", group,
-            "--wandb_tags", "dataset:cifar10,model:resnet18_head,approach:fixed",
-        ])
+    # 3) MNIST MLP: pruning from ReLU (post-training)
+    if "mnist_pruning" in include:
+        run_name = "mnist_prune_from_relu"
+        cmd = base_cmd + [
+            "--dataset", "mnist",
+            "--model", "mlp",
+            "--approach", "fixed",
+            "--linear_ratio", "0.0",
+            "--pruning",
+            "--epochs", str(args.epochs_mnist),
+            "--run_name", run_name
+        ]
+        add_wandb_flags(cmd, args.wandb_project, args.mode, args.wandb_entity, group,
+                        "dataset:mnist,approach:pruning", enable_wandb)
+        if not run_once(run_name, cmd, args.skip_existing):
+            failures.append(run_name)
 
-    # 6) CIFAR-10 Gating on head
-    rn = "cifar_head_gating"
-    cfg = make_common_cfg("cifar10", "resnet18_head", "gating", rn, epochs=args.epochs_cifar)
-    cfg["gating"] = {"enabled": True, "init_alpha": 0.8, "entropy_reg": 0.002, "l1_reg": 0.0, "hard_threshold": 0.1}
-    path = base / f"{rn}.json"
-    write_config(path, cfg)
-    jobs.append([
-        "python", "-m", "nonlinear_mlp.experiments.run_experiment",
-        "--config", str(path),
-        "--wandb",
-        "--wandb_project", args.project,
-        "--wandb_entity", args.entity or "",
-        "--wandb_mode", args.mode,
-        "--wandb_group", group,
-        "--wandb_tags", "dataset:cifar10,model:resnet18_head,approach:gating",
-    ])
+    # 4) CIFAR-10 ResNet-18 head: fixed ratios
+    if "cifar_fixed" in include:
+        ratios = [0.25, 0.5, 0.75]
+        for r in ratios:
+            run_name = f"cifar_head_fixed_{int(r*100)}"
+            cmd = base_cmd + [
+                "--dataset", "cifar10",
+                "--model", "resnet18_head",
+                "--approach", "fixed",
+                "--linear_ratio", str(r),
+                "--pattern", "structured",
+                "--epochs", str(args.epochs_cifar),
+                "--run_name", run_name
+            ]
+            add_wandb_flags(cmd, args.wandb_project, args.mode, args.wandb_entity, group,
+                            f"dataset:cifar10,model:resnet18_head,approach:fixed,ratio:{r}", enable_wandb)
+            if not run_once(run_name, cmd, args.skip_existing):
+                failures.append(run_name)
 
-    # 7) CIFAR-10 Pruning from ReLU on head
-    rn = "cifar_head_prune_from_relu"
-    cfg = make_common_cfg("cifar10", "resnet18_head", "fixed", rn, epochs=args.epochs_cifar)
-    cfg["fixed"] = {"linear_ratio": 0.0, "pattern": "structured"}
-    cfg["pruning"] = {"enabled": True}
-    path = base / f"{rn}.json"
-    write_config(path, cfg)
-    jobs.append([
-        "python", "-m", "nonlinear_mlp.experiments.run_experiment",
-        "--config", str(path),
-        "--wandb",
-        "--wandb_project", args.project,
-        "--wandb_entity", args.entity or "",
-        "--wandb_mode", args.mode,
-        "--wandb_group", group,
-        "--wandb_tags", "dataset:cifar10,model:resnet18_head,approach:pruning",
-    ])
+    # 5) CIFAR-10 ResNet-18 head: gating
+    if "cifar_gating" in include:
+        run_name = "cifar_head_gating"
+        cmd = base_cmd + [
+            "--dataset", "cifar10",
+            "--model", "resnet18_head",
+            "--gating",
+            "--epochs", str(args.epochs_cifar),
+            "--run_name", run_name
+        ]
+        add_wandb_flags(cmd, args.wandb_project, args.mode, args.wandb_entity, group,
+                        "dataset:cifar10,model:resnet18_head,approach:gating", enable_wandb)
+        if not run_once(run_name, cmd, args.skip_existing):
+            failures.append(run_name)
 
-    for cmd in jobs:
-        run_cmd(cmd)
+    # 6) CIFAR-10 ResNet-18 head: pruning from ReLU
+    if "cifar_pruning" in include:
+        run_name = "cifar_head_prune_from_relu"
+        cmd = base_cmd + [
+            "--dataset", "cifar10",
+            "--model", "resnet18_head",
+            "--approach", "fixed",
+            "--linear_ratio", "0.0",
+            "--pruning",
+            "--epochs", str(args.epochs_cifar),
+            "--run_name", run_name
+        ]
+        add_wandb_flags(cmd, args.wandb_project, args.mode, args.wandb_entity, group,
+                        "dataset:cifar10,model:resnet18_head,approach:pruning", enable_wandb)
+        if not run_once(run_name, cmd, args.skip_existing):
+            failures.append(run_name)
 
-    print("Sweep complete.")
+    # 7) Tabular Adult MLP: fixed + gating (optional small runs)
+    if "adult_fixed" in include:
+        run_name = "adult_fixed_50"
+        cmd = base_cmd + [
+            "--dataset", "tabular_adult",
+            "--model", "mlp",
+            "--approach", "fixed",
+            "--linear_ratio", "0.5",
+            "--epochs", str(args.epochs_adult),
+            "--run_name", run_name
+        ]
+        add_wandb_flags(cmd, args.wandb_project, args.mode, args.wandb_entity, group,
+                        "dataset:adult,approach:fixed,ratio:0.5", enable_wandb)
+        if not run_once(run_name, cmd, args.skip_existing):
+            failures.append(run_name)
 
+    if "adult_gating" in include:
+        run_name = "adult_gating"
+        cmd = base_cmd + [
+            "--dataset", "tabular_adult",
+            "--model", "mlp",
+            "--gating",
+            "--epochs", str(args.epochs_adult),
+            "--run_name", run_name
+        ]
+        add_wandb_flags(cmd, args.wandb_project, args.mode, args.wandb_entity, group,
+                        "dataset:adult,approach:gating", enable_wandb)
+        if not run_once(run_name, cmd, args.skip_existing):
+            failures.append(run_name)
+
+    if failures:
+        print("\nSome runs failed:")
+        for r in failures:
+            print(" -", r)
+    else:
+        print("\nAll selected runs completed or were skipped (idempotent).")
 
 if __name__ == "__main__":
     main()
