@@ -30,7 +30,7 @@ def make_common_cfg(dataset, model, approach, run_name, **kwargs):
         "model": model,
         "approach": approach,
         "logging": {"run_name": run_name},
-        "training": {"epochs": kwargs.get("epochs", 10), "batch_size": kwargs.get("batch_size", 128)},
+        "training": {"epochs": kwargs.get("epochs", 20), "batch_size": kwargs.get("batch_size", 128)},
     }
     if model == "mlp":
         cfg["hidden_dims"] = kwargs.get("hidden_dims", [512, 256, 128])
