@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 """
-Sweep deterministic per-neuron zeroing on MNIST MLP:
-- N in {0, 25, 50, 75, 100} as zero_ratio (fraction of neurons permanently zeroed per hidden layer).
+Sweep deterministic per-neuron zeroing on MNIST MLP (excluding 100%):
+- Ratios: {0, 25, 50, 75} as zero_ratio (fraction of neurons permanently zeroed per hidden layer).
 - Idempotent: skips runs with runs/<run_name>/meta.json
 - Uses run_experiment.py (per-step W&B logging supported via flags)
 
 Usage:
-  python -m nonlinear_mlp.scripts.run_mnist_mlp_nldropout_sweep --wandb_project nonlinear-mlp --mode online
+  python -m nonlinear_mlp.scripts.run_mnist_nldropout --wandb_project nonlinear-mlp --mode online
 """
 import argparse
 import os
@@ -44,7 +44,8 @@ def main():
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--mode", type=str, default="disabled", choices=["online", "offline", "disabled"])
     parser.add_argument("--group", type=str, default=None)
-    parser.add_argument("--skip_existing", action="store_true", default=True)
+    parser.add_argument("--skip_existing", action="store_true", default=True, help="Skip runs that already have meta.json")
+    parser.add_argument("--no_skip_existing", dest="skip_existing", action="store_false", help="Do not skip existing runs")
     parser.add_argument("--epochs", type=int, default=20)
     args = parser.parse_args()
 
@@ -54,20 +55,29 @@ def main():
 
     base_cmd = ["python", "-m", "nonlinear_mlp.experiments.run_experiment"]
 
+    ratios = [0.25, 0.5, 0.75]
+
     failures = []
-    for r in [0.25, 0.5, 0.75]:
+    for r in ratios:
         run_name = f"mnist_mlp_nldropout_{int(r*100)}"
         cmd = base_cmd + [
             "--dataset", "mnist",
             "--model", "mlp",
             "--approach", "nl_dropout",  # deterministic zeroing (not random)
-            "--linear_ratio", str(r),    # interpreted as zero_ratio
-            "--pattern", "structured",   # last K neurons per layer are zeroed
+            "--linear_ratio", str(r),    # interpreted as zero_ratio in NonlinearityDropoutLayer
+            "--pattern", "structured",   # last K neurons per layer are zeroed (use 'random' for seeded selection)
             "--epochs", str(args.epochs),
             "--run_name", run_name,
         ]
-        add_wandb_flags(cmd, args.wandb_project, args.mode, args.wandb_entity, group,
-                        f"dataset:mnist,model:mlp,approach:nl_dropout,zero_ratio:{r}", enable_wandb)
+        add_wandb_flags(
+            cmd,
+            args.wandb_project,
+            args.mode,
+            args.wandb_entity,
+            group,
+            f"dataset:mnist,model:mlp,approach:nl_dropout,zero_ratio:{int(r*100)}",
+            enable_wandb,
+        )
         if not run_once(run_name, cmd, args.skip_existing):
             failures.append(run_name)
 
