@@ -1,21 +1,18 @@
 import argparse
+import json
+import os
+import random
+import time
+import numpy as np
 import torch
+import torch.nn as nn
+
 from nonlinear_mlp.config import ExperimentConfig
 from nonlinear_mlp.data.mnist import get_mnist_loaders
 from nonlinear_mlp.data.cifar10 import get_cifar10_loaders
 from nonlinear_mlp.data.tabular import load_adult
 from nonlinear_mlp.models.mlp import MLP
 from nonlinear_mlp.models.cifar_head import build_resnet18_with_mlp_head
-from nonlinear_mlp.train import train_one_epoch, evaluate, save_checkpoint
-from nonlinear_mlp.utils.profiler import count_params, model_linear_flops
-from nonlinear_mlp.utils.metrics import measure_inference_latency, memory_usage_mb
-from nonlinear_mlp.analysis.activation_stats import ActivationTracker
-from nonlinear_mlp.pruning.post_training import decide_linearization, apply_layer_linearization
-import json
-import os
-import random
-import numpy as np
-import time
 
 # Optional imports (guarded)
 try:
@@ -30,6 +27,17 @@ try:
 except Exception:
     RESNET50_AVAILABLE = False
 
+# Import training utilities; we will implement our own per-step train loop here,
+# but still reuse evaluate() and save_checkpoint(), and compute_regularization().
+from nonlinear_mlp.train import evaluate, save_checkpoint, compute_regularization
+from nonlinear_mlp.utils.profiler import count_params, model_linear_flops
+from nonlinear_mlp.utils.metrics import measure_inference_latency, memory_usage_mb, accuracy
+from nonlinear_mlp.analysis.activation_stats import ActivationTracker
+from nonlinear_mlp.pruning.post_training import decide_linearization, apply_layer_linearization
+
+# =========================
+# W&B helpers (self-contained)
+# =========================
 def _maybe_init_wandb(cfg: ExperimentConfig, out_dir: str):
     wb = {"enabled": False, "wandb": None}
     if not getattr(cfg.logging, "wandb_enabled", False):
@@ -40,18 +48,15 @@ def _maybe_init_wandb(cfg: ExperimentConfig, out_dir: str):
         print(f"[W&B] wandb not installed; disable logging ({e}).")
         return wb
 
-    # Determine dir for W&B files (per-run folder)
     wandb_dir = getattr(cfg.logging, "wandb_dir", None) or os.path.join(out_dir, "wandb")
     os.makedirs(wandb_dir, exist_ok=True)
 
-    # Map settings
     project = getattr(cfg.logging, "wandb_project", "nonlinear-mlp")
     entity = getattr(cfg.logging, "wandb_entity", None)
     group = getattr(cfg.logging, "wandb_group", None)
     tags = getattr(cfg.logging, "wandb_tags", []) or []
-    mode = getattr(cfg.logging, "wandb_mode", None)  # 'online'|'offline'|'disabled'
+    mode = getattr(cfg.logging, "wandb_mode", None)  # 'online'|'offline'|'disabled'|None
 
-    # Initialize
     run = wandb.init(
         project=project,
         entity=entity,
@@ -70,6 +75,23 @@ def _maybe_init_wandb(cfg: ExperimentConfig, out_dir: str):
     print(f"[W&B] Initialized run at {wandb_dir} (project={project}, entity={entity}, group={group})")
     return wb
 
+def _wandb_log_step(wb, step_record: dict, global_step: int):
+    """Per-step (per-batch) logging to W&B."""
+    if not wb.get("enabled", False):
+        return
+    wandb = wb["wandb"]
+    payload = {
+        "step": global_step,
+        "epoch": step_record.get("epoch"),
+        "batch_idx": step_record.get("batch_idx"),
+        "train/step_loss": step_record.get("loss"),
+        "train/step_acc": step_record.get("acc"),
+        "train/step_reg": step_record.get("reg"),
+        "train/batch_size": step_record.get("batch_size"),
+        "lr": step_record.get("lr"),
+    }
+    wandb.log({k: v for k, v in payload.items() if v is not None}, step=global_step)
+
 def _wandb_log_epoch(wb, epoch_record: dict, epoch_num: int):
     if not wb.get("enabled", False):
         return
@@ -83,16 +105,6 @@ def _wandb_log_epoch(wb, epoch_record: dict, epoch_num: int):
         "time/train_s": epoch_record.get("train_time_s"),
     }
     wandb.log({k: v for k, v in to_log.items() if v is not None}, step=epoch_num)
-
-    # Log gating summary if present
-    gating_list = epoch_record.get("gating", [])
-    if gating_list:
-        # layer-wise scalar stats
-        for g in gating_list:
-            layer_idx = g.get("layer")
-            for key in ["alpha_mean", "alpha_median", "alpha_min", "alpha_max", "alpha_lt_0.1", "alpha_lt_0.25", "alpha_gt_0.9"]:
-                if key in g:
-                    wandb.log({f"gating/{key}/layer_{layer_idx}": g[key]}, step=epoch_num)
 
 def _wandb_log_alpha_histograms(wb, model, epoch_num: int, log_hist: bool = True):
     if not (wb.get("enabled", False) and log_hist):
@@ -109,7 +121,6 @@ def _wandb_log_alpha_histograms(wb, model, epoch_num: int, log_hist: bool = True
         if isinstance(layer, GatedActivationLayer):
             with torch.no_grad():
                 a = layer.alpha().detach().float().cpu().numpy()
-            # histogram per layer
             try:
                 hist = wandb.Histogram(a)
                 wandb.log({f"gating/alpha_hist_layer_{i}": hist}, step=epoch_num)
@@ -120,9 +131,8 @@ def _wandb_log_meta(wb, meta: dict):
     if not wb.get("enabled", False):
         return
     wandb = wb["wandb"]
-    # push meta summary fields
-    lat = meta.get("latency", {})
-    pc = meta.get("param_counts", {})
+    lat = meta.get("latency", {}) or {}
+    pc = meta.get("param_counts", {}) or {}
     for k, v in {
         "latency/mean_s": lat.get("mean_latency_s"),
         "latency/p50_s": lat.get("p50_latency_s"),
@@ -133,7 +143,7 @@ def _wandb_log_meta(wb, meta: dict):
         "flops/approx_linear": meta.get("approx_linear_flops"),
         "memory/mb": meta.get("memory_mb"),
     }.items():
-        if v is not None:
+        if v is not None and getattr(wandb, "run", None):
             wandb.run.summary[k] = v
 
 def _wandb_finish(wb):
@@ -142,9 +152,10 @@ def _wandb_finish(wb):
             wb["run"].finish()
         except Exception:
             pass
-# ----------------------------------------------------------
 
-
+# =========================
+# Utilities
+# =========================
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -217,6 +228,104 @@ def get_data(cfg: ExperimentConfig):
         raise ValueError(f"Unsupported dataset {cfg.dataset}")
     return train_loader, test_loader, input_dim, num_classes
 
+# =========================
+# Per-step training loop (inside this module)
+# =========================
+def _train_one_epoch_step_logging(
+    model,
+    loader,
+    optimizer,
+    device: str,
+    scaler,
+    epoch: int,
+    cfg: ExperimentConfig,
+    log_interval: int,
+    wb,                  # wandb context dict from _maybe_init_wandb
+    global_step: int     # global step counter carried across epochs
+):
+    model.train()
+    criterion = nn.CrossEntropyLoss()
+
+    running_loss = 0.0
+    running_acc = 0.0
+    seen = 0
+    start_time = time.time()
+
+    for batch_idx, (x, y) in enumerate(loader):
+        x, y = x.to(device), y.to(device)
+        # Flatten for MLPs (e.g., MNIST 1x28x28 -> 784)
+        if x.ndim == 4 and model.__class__.__name__ == "MLP":
+            x = x.view(x.size(0), -1)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        # Modern AMP autocast
+        with torch.amp.autocast(device_type="cuda", enabled=getattr(cfg.training, "amp", False) and device.startswith("cuda")):
+            logits = model(x)
+            cls_loss = criterion(logits, y)
+            # Regularization from nonlinear_mlp.train
+            reg_loss = compute_regularization(model, cfg, device)
+            total_loss = cls_loss + reg_loss
+
+        # Backward + step
+        if scaler:
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            total_loss.backward()
+            optimizer.step()
+
+        # Metrics
+        with torch.no_grad():
+            acc1 = accuracy(logits, y, topk=(1,))[0]  # percentage
+
+        bsz = x.size(0)
+        running_loss += cls_loss.item() * bsz
+        running_acc += acc1 * bsz
+        seen += bsz
+
+        # Per-step W&B log
+        try:
+            _wandb_log_step(
+                wb,
+                {
+                    "epoch": epoch,
+                    "batch_idx": batch_idx,
+                    "batch_size": int(bsz),
+                    "loss": float(cls_loss.item()),
+                    "acc": float(acc1),
+                    "reg": float(reg_loss.item()),
+                    "lr": float(optimizer.param_groups[0].get("lr", 0.0)),
+                },
+                global_step,
+            )
+        except Exception:
+            # Do not break training if logging fails
+            pass
+
+        # Optional console log
+        if (batch_idx + 1) % max(1, int(log_interval)) == 0:
+            avg_loss = running_loss / max(1, seen)
+            avg_acc = running_acc / max(1, seen)
+            print(
+                f"Epoch {epoch} [{batch_idx+1}/{len(loader)}] "
+                f"Loss: {avg_loss:.4f} Acc: {avg_acc:.2f} Reg: {float(reg_loss.item()):.4f}"
+            )
+
+        global_step += 1
+
+    duration = time.time() - start_time
+    train_stats = {
+        "train_loss": running_loss / max(1, seen),
+        "train_acc": running_acc / max(1, seen),
+        "train_time_s": duration,
+    }
+    return train_stats, global_step
+
+# =========================
+# Main
+# =========================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, help="Path to JSON config (optional)")
@@ -313,24 +422,36 @@ def main():
         "approx_linear_flops": model_linear_flops(model),
         "config": json.loads(cfg.to_json())
     }
-    # If W&B enabled, store some meta in config/summary
+    # If W&B enabled, store some meta in summary early
     if wb.get("enabled", False):
         _wandb_log_meta(wb, {"param_counts": meta["param_counts"], "approx_linear_flops": meta["approx_linear_flops"]})
 
     history = []
     best_val = -1
     patience_counter = 0
+    global_step = 0  # step counter across epochs and fine-tune
 
+    # ========== TRAIN EPOCHS WITH PER-STEP W&B LOGGING ==========
     for epoch in range(1, cfg.training.epochs + 1):
-        train_stats = train_one_epoch(model, train_loader, optimizer, device, scaler, epoch, cfg, log_interval=cfg.logging.log_interval)
+        train_stats, global_step = _train_one_epoch_step_logging(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            scaler=scaler,
+            epoch=epoch,
+            cfg=cfg,
+            log_interval=cfg.logging.log_interval,
+            wb=wb,
+            global_step=global_step,
+        )
+
         val_stats = evaluate(model, test_loader, device, cfg)
         gating_stats = model.gather_gating_stats() if hasattr(model, "gather_gating_stats") else []
         record = {**train_stats, **val_stats, "epoch": epoch, "gating": gating_stats}
         history.append(record)
 
         print(f"[Epoch {epoch}] Val Acc: {val_stats['val_acc']:.2f}")
-
-        # W&B per-epoch logging
         _wandb_log_epoch(wb, record, epoch)
         _wandb_log_alpha_histograms(wb, model, epoch, log_hist=getattr(cfg.logging, "wandb_log_alpha_hist", True))
 
@@ -352,7 +473,6 @@ def main():
         hardened_eval = evaluate(model, test_loader, device, cfg)
         print("After harden val acc:", hardened_eval)
         history.append({"epoch": "hardened", **hardened_eval, "gating": model.gather_gating_stats()})
-        # Log post-harden
         if wb.get("enabled", False):
             wb["wandb"].log({"val/acc_hardened": hardened_eval.get("val_acc")})
 
@@ -370,9 +490,20 @@ def main():
             nonlinear_score_thresh=cfg.pruning.nonlinear_contribution_threshold
         )
         model = apply_layer_linearization(model, decisions, verbose=True)
-        # Optional fine-tune
+        # Optional fine-tune (also step-logged)
         for ft_epoch in range(cfg.pruning.fine_tune_epochs):
-            _ = train_one_epoch(model, train_loader, optimizer, device, scaler, ft_epoch, cfg, log_interval=cfg.logging.log_interval)
+            _train_stats, global_step = _train_one_epoch_step_logging(
+                model=model,
+                loader=train_loader,
+                optimizer=optimizer,
+                device=device,
+                scaler=scaler,
+                epoch=ft_epoch,  # local counter for FT
+                cfg=cfg,
+                log_interval=cfg.logging.log_interval,
+                wb=wb,
+                global_step=global_step,
+            )
         prune_eval = evaluate(model, test_loader, device, cfg)
         print("Prune evaluation:", prune_eval)
         history.append({"epoch": "post_prune", **prune_eval})
