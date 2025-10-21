@@ -13,6 +13,7 @@ from nonlinear_mlp.data.cifar10 import get_cifar10_loaders
 from nonlinear_mlp.data.tabular import load_adult
 from nonlinear_mlp.models.mlp import MLP
 from nonlinear_mlp.models.cifar_head import build_resnet18_with_mlp_head
+from nonlinear_mlp.models.cnn_plain import PlainCNN9
 
 # Optional imports (guarded)
 try:
@@ -27,8 +28,6 @@ try:
 except Exception:
     RESNET50_AVAILABLE = False
 
-# Import training utilities; we will implement our own per-step train loop here,
-# but still reuse evaluate() and save_checkpoint(), and compute_regularization().
 from nonlinear_mlp.train import evaluate, save_checkpoint, compute_regularization
 from nonlinear_mlp.utils.profiler import count_params, model_linear_flops
 from nonlinear_mlp.utils.metrics import measure_inference_latency, memory_usage_mb, accuracy
@@ -76,7 +75,6 @@ def _maybe_init_wandb(cfg: ExperimentConfig, out_dir: str):
     return wb
 
 def _wandb_log_step(wb, step_record: dict, global_step: int):
-    """Per-step (per-batch) logging to W&B."""
     if not wb.get("enabled", False):
         return
     wandb = wb["wandb"]
@@ -200,6 +198,13 @@ def build_model(cfg: ExperimentConfig, input_dim=None, num_classes=None):
             pretrained=False,
             freeze_backbone=False
         )
+    elif cfg.model == "cnn9_plain":
+        # Nonlinearity control via fixed.linear_ratio/pattern (remove ReLU at some convs)
+        return PlainCNN9(
+            num_classes=num_classes or cfg.num_classes,
+            linear_ratio=getattr(cfg.fixed, "linear_ratio", 0.0),
+            pattern=getattr(cfg.fixed, "pattern", "structured"),
+        )
     else:
         raise ValueError(f"Unknown model {cfg.model}")
 
@@ -253,7 +258,7 @@ def _train_one_epoch_step_logging(
 
     for batch_idx, (x, y) in enumerate(loader):
         x, y = x.to(device), y.to(device)
-        # Flatten for MLPs (e.g., MNIST 1x28x28 -> 784)
+        # Flatten only for MLPs
         if x.ndim == 4 and model.__class__.__name__ == "MLP":
             x = x.view(x.size(0), -1)
 
@@ -263,11 +268,9 @@ def _train_one_epoch_step_logging(
         with torch.amp.autocast(device_type="cuda", enabled=getattr(cfg.training, "amp", False) and device.startswith("cuda")):
             logits = model(x)
             cls_loss = criterion(logits, y)
-            # Regularization from nonlinear_mlp.train
             reg_loss = compute_regularization(model, cfg, device)
             total_loss = cls_loss + reg_loss
 
-        # Backward + step
         if scaler:
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
@@ -276,7 +279,6 @@ def _train_one_epoch_step_logging(
             total_loss.backward()
             optimizer.step()
 
-        # Metrics
         with torch.no_grad():
             acc1 = accuracy(logits, y, topk=(1,))[0]  # percentage
 
@@ -301,10 +303,8 @@ def _train_one_epoch_step_logging(
                 global_step,
             )
         except Exception:
-            # Do not break training if logging fails
             pass
 
-        # Optional console log
         if (batch_idx + 1) % max(1, int(log_interval)) == 0:
             avg_loss = running_loss / max(1, seen)
             avg_acc = running_acc / max(1, seen)
@@ -402,14 +402,36 @@ def main():
     train_loader, test_loader, input_dim, num_classes = get_data(cfg)
     model = build_model(cfg, input_dim=input_dim, num_classes=num_classes).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay)
+    # Optimizer selection
+    # - For cnn9_plain: default to SGD with CIFAR-10 recipe unless cfg overrides
+    # - Else: default AdamW (existing behavior)
+    use_sgd = (cfg.model == "cnn9_plain")
+    opt_name = getattr(cfg.training, "optimizer", "sgd" if use_sgd else "adamw").lower()
+    if opt_name == "sgd":
+        lr = getattr(cfg.training, "lr", 0.1 if use_sgd else 1e-3)
+        momentum = getattr(cfg.training, "momentum", 0.9 if use_sgd else 0.9)
+        weight_decay = getattr(cfg.training, "weight_decay", 5e-4 if use_sgd else 1e-2)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=False)
+        # Classic CIFAR-10 schedule
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer,
+            milestones=getattr(cfg.training, "milestones", [100, 150]),
+            gamma=getattr(cfg.training, "gamma", 0.1)
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=getattr(cfg.training, "lr", 1e-3),
+            weight_decay=getattr(cfg.training, "weight_decay", 1e-2)
+        )
+        scheduler = None
 
     # Modern AMP scaler (fallback to legacy if needed)
     try:
-        scaler = torch.amp.GradScaler("cuda") if (device.startswith("cuda") and cfg.training.amp) else None
+        scaler = torch.amp.GradScaler("cuda") if (device.startswith("cuda") and getattr(cfg.training, "amp", True)) else None
     except Exception:
         from torch.cuda.amp import GradScaler as _LegacyGradScaler
-        scaler = _LegacyGradScaler() if (device.startswith("cuda") and cfg.training.amp) else None
+        scaler = _LegacyGradScaler() if (device.startswith("cuda") and getattr(cfg.training, "amp", True)) else None
 
     out_dir = f"{cfg.logging.output_dir}/{cfg.logging.run_name}"
     os.makedirs(out_dir, exist_ok=True)
@@ -422,16 +444,15 @@ def main():
         "approx_linear_flops": model_linear_flops(model),
         "config": json.loads(cfg.to_json())
     }
-    # If W&B enabled, store some meta in summary early
     if wb.get("enabled", False):
         _wandb_log_meta(wb, {"param_counts": meta["param_counts"], "approx_linear_flops": meta["approx_linear_flops"]})
 
     history = []
     best_val = -1
     patience_counter = 0
-    global_step = 0  # step counter across epochs and fine-tune
+    global_step = 0
 
-    # ========== TRAIN EPOCHS WITH PER-STEP W&B LOGGING ==========
+    # Train with per-step W&B logging
     for epoch in range(1, cfg.training.epochs + 1):
         train_stats, global_step = _train_one_epoch_step_logging(
             model=model,
@@ -453,7 +474,6 @@ def main():
 
         print(f"[Epoch {epoch}] Val Acc: {val_stats['val_acc']:.2f}")
         _wandb_log_epoch(wb, record, epoch)
-        _wandb_log_alpha_histograms(wb, model, epoch, log_hist=getattr(cfg.logging, "wandb_log_alpha_hist", True))
 
         if val_stats["val_acc"] > best_val:
             best_val = val_stats["val_acc"]
@@ -466,17 +486,20 @@ def main():
                 print("Early stopping triggered.")
                 break
 
-    # Post-training gating harden
-    if cfg.approach == "gating":
+        if scheduler is not None:
+            scheduler.step()
+
+    # Post-training gating harden (if applicable to other models)
+    if cfg.approach == "gating" and hasattr(model, "harden_gates"):
         print("Hardening gates...")
         model.harden_gates(threshold=cfg.gating.hard_threshold)
         hardened_eval = evaluate(model, test_loader, device, cfg)
         print("After harden val acc:", hardened_eval)
-        history.append({"epoch": "hardened", **hardened_eval, "gating": model.gather_gating_stats()})
+        history.append({"epoch": "hardened", **hardened_eval, "gating": getattr(model, "gather_gating_stats", lambda: [])()})
         if wb.get("enabled", False):
             wb["wandb"].log({"val/acc_hardened": hardened_eval.get("val_acc")})
 
-    # Post-training pruning
+    # Post-training pruning (head/MLP models benefit most; CNN9 here is behaviorally linear only)
     if cfg.pruning.enabled:
         print("Collecting activation stats for pruning...")
         tracker = ActivationTracker(max_batches=50)
@@ -490,7 +513,6 @@ def main():
             nonlinear_score_thresh=cfg.pruning.nonlinear_contribution_threshold
         )
         model = apply_layer_linearization(model, decisions, verbose=True)
-        # Optional fine-tune (also step-logged)
         for ft_epoch in range(cfg.pruning.fine_tune_epochs):
             _train_stats, global_step = _train_one_epoch_step_logging(
                 model=model,
@@ -498,7 +520,7 @@ def main():
                 optimizer=optimizer,
                 device=device,
                 scaler=scaler,
-                epoch=ft_epoch,  # local counter for FT
+                epoch=ft_epoch,
                 cfg=cfg,
                 log_interval=cfg.logging.log_interval,
                 wb=wb,
