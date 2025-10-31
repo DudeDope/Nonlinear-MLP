@@ -230,6 +230,10 @@ def get_data(cfg: ExperimentConfig):
         train_loader, test_loader = get_cifar10_loaders(batch_size=cfg.training.batch_size)
         input_dim = None
         num_classes = 10
+    elif cfg.dataset == "cifar100":
+        train_loader, test_loader = get_cifar100_loaders(batch_size=cfg.training.batch_size)
+        input_dim = None
+        num_classes = 100
     elif cfg.dataset == "imagenet":
         if not IMAGENET_AVAILABLE:
             raise RuntimeError("Imagenet dataset loader not available. Ensure imagenet.py exists.")
