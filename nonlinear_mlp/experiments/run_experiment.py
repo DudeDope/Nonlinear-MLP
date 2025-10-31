@@ -14,6 +14,7 @@ from nonlinear_mlp.data.tabular import load_adult
 from nonlinear_mlp.models.mlp import MLP
 from nonlinear_mlp.models.cifar_head import build_resnet18_with_mlp_head
 from nonlinear_mlp.models.cnn_plain import PlainCNN9
+from nonlinear_mlp.models.mlp_control import MLPControl
 
 # Optional imports (guarded)
 try:
@@ -204,6 +205,18 @@ def build_model(cfg: ExperimentConfig, input_dim=None, num_classes=None):
             num_classes=num_classes or cfg.num_classes,
             linear_ratio=getattr(cfg.fixed, "linear_ratio", 0.0),
             pattern=getattr(cfg.fixed, "pattern", "structured"),
+        )
+    elif cfg.model == "mlp_control":
+        # Control MLP: shrink widths structurally based on desired nonlinearity fraction
+        if input_dim is None:
+            raise ValueError("mlp_control requires input_dim for standalone MLPs.")
+        return MLPControl(
+            input_dim=int(input_dim),
+            base_hidden_dims=cfg.hidden_dims,
+            num_classes=num_classes or cfg.num_classes,
+            fixed_cfg=getattr(cfg, "fixed").__dict__,
+            layerwise_cfg=getattr(cfg, "layerwise").__dict__,
+            min_width=getattr(cfg, "control_min_width", 1) if hasattr(cfg, "control_min_width") else 1,
         )
     else:
         raise ValueError(f"Unknown model {cfg.model}")
