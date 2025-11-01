@@ -1,100 +1,94 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from nonlinear_mlp.layers.mixed2d import ChannelMixedActivation2d
+from typing import Optional
+
+
+class ChannelMixedActivation2d(nn.Module):
+    """
+    Per-channel activation control:
+      mask[c] = 1 -> ReLU on channel c
+      mask[c] = 0 -> Identity on channel c
+    """
+    def __init__(self, num_channels: int, mask: Optional[torch.Tensor] = None):
+        super().__init__()
+        if mask is None:
+            mask = torch.ones(num_channels, dtype=torch.float32)
+        self.register_buffer("mask", mask, persistent=False)
+
+    def set_linear_ratio(self, linear_ratio: float, pattern: str = "structured"):
+        C = int(self.mask.numel())
+        k = max(0, min(C, int(round(linear_ratio * C))))
+        mask = torch.ones(C, dtype=torch.float32, device=self.mask.device)
+        if k > 0:
+            if pattern == "structured":
+                mask[-k:] = 0.0  # last k channels linear (identity)
+            else:
+                g = torch.Generator(device=self.mask.device)
+                g.manual_seed(1337)
+                idx = torch.randperm(C, generator=g)[:k]
+                mask[idx] = 0.0
+        self.mask = mask
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, H, W]
+        relu = F.relu(x, inplace=False)
+        m = self.mask.view(1, -1, 1, 1)
+        return relu * m + x * (1.0 - m)
+
+
+class ConvBN(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn = nn.BatchNorm2d(out_ch)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv(x)
+        x = self.bn(x)
+        return x
+
 
 class PlainCNN9(nn.Module):
     """
-    9-layer plain CNN for CIFAR-10 with per-channel nonlinearity control.
+    9-layer plain CNN with BatchNorm and channel-wise activation control after each conv.
+    - Downsample with MaxPool after conv indices 2 and 5 (after 3rd and 6th conv).
+    - Global average pooling + Linear classifier.
 
-    Convs (9 total): [3->64, 64->64, 64->64, 64->128, 128->128, 128->128, 128->256, 256->256, 256->256]
-    - After each conv, apply ChannelMixedActivation2d (per-channel Identity vs ReLU).
-    - MaxPool2d(2) after conv indices 2 and 5 for downsampling.
-    - Global AvgPool and a Linear head to num_classes.
-
-    Control:
-    - linear_ratio ∈ [0,1] applied per conv layer: fraction of channels set to Identity (linear).
-    - pattern='structured': choose the deepest channels in each layer to be linear
-      (i.e., highest channel indices). You can extend with 'random' if needed.
-
-    Stats:
-    - gather_linearization_stats() to see the effective linear channel counts.
+    linear_ratio: fraction of channels that bypass ReLU (identity). The remainder use ReLU.
     """
-    def __init__(self, num_classes=10, linear_ratio: float = 0.0, pattern: str = "structured"):
+    def __init__(self, num_classes: int = 100, linear_ratio: float = 0.0, pattern: str = "structured"):
         super().__init__()
-        self.num_classes = num_classes
-        # Define conv channels
-        channels = [64, 64, 64, 128, 128, 128, 256, 256, 256]
-        in_c = 3
-        self.convs = nn.ModuleList()
-        for out_c in channels:
-            self.convs.append(nn.Conv2d(in_c, out_c, kernel_size=3, stride=1, padding=1, bias=True))
-            in_c = out_c
+        ch = [3, 64, 64, 64, 128, 128, 128, 256, 256, 256]  # 9 conv blocks
+        self.convs = nn.ModuleList([ConvBN(ch[i], ch[i+1]) for i in range(9)])
+        self.acts = nn.ModuleList([ChannelMixedActivation2d(ch[i+1]) for i in range(9)])
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.classifier = nn.Linear(ch[-1], num_classes)
 
-        # Channel-wise nonlinear activations per conv
-        self.acts = nn.ModuleList([ChannelMixedActivation2d(c) for c in channels])
-
-        # Classifier head
-        self.fc = nn.Linear(256, num_classes)
-
-        # Initialize per-channel masks
         self.set_linear_ratio(linear_ratio, pattern)
+        self._init_weights()
 
-    def _make_channel_mask(self, C: int, linear_ratio: float, pattern: str) -> torch.Tensor:
-        """
-        Returns a 1D tensor of length C with values {0,1} where:
-          - 1 means nonlinear (ReLU)
-          - 0 means linear (Identity)
-        structured: set the last K channels to 0 (linear).
-        """
-        r = float(max(0.0, min(1.0, linear_ratio)))
-        k = int(round(r * C))
-        mask = torch.ones(C, dtype=torch.float32)  # default nonlinear
-        if k <= 0:
-            return mask
-        if pattern == "structured":
-            mask[-k:] = 0.0
-        else:
-            # fallback structured
-            mask[-k:] = 0.0
-        return mask
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                if m.bias is not None:
+                    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)
+                    bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                    nn.init.uniform_(m.bias, -bound, bound)
 
     def set_linear_ratio(self, linear_ratio: float, pattern: str = "structured"):
-        """
-        Apply the same per-channel linear_ratio to every conv's activation.
-        """
-        for i, act in enumerate(self.acts):
-            C = act.mask.numel()
-            act.set_mask(self._make_channel_mask(C, linear_ratio, pattern))
+        for act in self.acts:
+            act.set_linear_ratio(linear_ratio, pattern)
 
-    @torch.no_grad()
-    def gather_linearization_stats(self):
-        total_channels = 0
-        linear_channels = 0
-        per_layer = []
-        for i, act in enumerate(self.acts):
-            C = act.mask.numel()
-            lin = int((act.mask == 0).sum().item())
-            per_layer.append({"layer": i, "channels": C, "linear_channels": lin, "linear_ratio_layer": lin / C})
-            total_channels += C
-            linear_channels += lin
-        return {
-            "total_conv_layers": len(self.acts),
-            "total_channels": total_channels,
-            "total_linear_channels": linear_channels,
-            "linear_ratio_effective": linear_channels / total_channels if total_channels else 0.0,
-            "per_layer": per_layer,
-        }
-
-    def forward(self, x):
-        # Downsample after conv idx 2 and 5
-        for i, (conv, act) in enumerate(zip(self.convs, self.acts)):
-            x = conv(x)
-            x = act(x)
-            if i in (2, 5):
-                x = F.max_pool2d(x, kernel_size=2, stride=2)
-
-        x = F.adaptive_avg_pool2d(x, (1, 1))
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-        return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for i in range(9):
+            x = self.convs[i](x)
+            x = self.acts[i](x)
+            if i == 2 or i == 5:
+                x = self.pool(x)
+        x = x.mean(dim=[2, 3])  # global average pooling
+        return self.classifier(x)
