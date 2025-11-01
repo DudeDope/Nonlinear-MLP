@@ -6,6 +6,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+from types import SimpleNamespace
 
 from nonlinear_mlp.config import ExperimentConfig
 from nonlinear_mlp.data.mnist import get_mnist_loaders
@@ -30,11 +31,15 @@ try:
 except Exception:
     RESNET50_AVAILABLE = False
 
+# Optimizer and loss builders (CIFAR-grade defaults, proper param groups)
+from nonlinear_mlp.training.optim import build_optimizer_and_scheduler, cross_entropy_loss
+
 from nonlinear_mlp.train import evaluate, save_checkpoint, compute_regularization
 from nonlinear_mlp.utils.profiler import count_params, model_linear_flops
 from nonlinear_mlp.utils.metrics import measure_inference_latency, memory_usage_mb, accuracy
 from nonlinear_mlp.analysis.activation_stats import ActivationTracker
 from nonlinear_mlp.pruning.post_training import decide_linearization, apply_layer_linearization
+
 
 # =========================
 # W&B helpers (self-contained)
@@ -46,6 +51,7 @@ def _maybe_init_wandb(cfg: ExperimentConfig, out_dir: str):
     try:
         import wandb
     except Exception as e:
+            # do not fail run if wandb missing
         print(f"[W&B] wandb not installed; disable logging ({e}).")
         return wb
 
@@ -76,6 +82,7 @@ def _maybe_init_wandb(cfg: ExperimentConfig, out_dir: str):
     print(f"[W&B] Initialized run at {wandb_dir} (project={project}, entity={entity}, group={group})")
     return wb
 
+
 def _wandb_log_step(wb, step_record: dict, global_step: int):
     if not wb.get("enabled", False):
         return
@@ -92,6 +99,7 @@ def _wandb_log_step(wb, step_record: dict, global_step: int):
     }
     wandb.log({k: v for k, v in payload.items() if v is not None}, step=global_step)
 
+
 def _wandb_log_epoch(wb, epoch_record: dict, epoch_num: int):
     if not wb.get("enabled", False):
         return
@@ -105,6 +113,7 @@ def _wandb_log_epoch(wb, epoch_record: dict, epoch_num: int):
         "time/train_s": epoch_record.get("train_time_s"),
     }
     wandb.log({k: v for k, v in to_log.items() if v is not None}, step=epoch_num)
+
 
 def _wandb_log_alpha_histograms(wb, model, epoch_num: int, log_hist: bool = True):
     if not (wb.get("enabled", False) and log_hist):
@@ -127,6 +136,7 @@ def _wandb_log_alpha_histograms(wb, model, epoch_num: int, log_hist: bool = True
             except Exception:
                 pass
 
+
 def _wandb_log_meta(wb, meta: dict):
     if not wb.get("enabled", False):
         return
@@ -146,12 +156,14 @@ def _wandb_log_meta(wb, meta: dict):
         if v is not None and getattr(wandb, "run", None):
             wandb.run.summary[k] = v
 
+
 def _wandb_finish(wb):
     if wb.get("enabled", False):
         try:
             wb["run"].finish()
         except Exception:
             pass
+
 
 # =========================
 # Utilities
@@ -164,6 +176,61 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
+
+
+def _ensure_training_defaults(cfg: ExperimentConfig):
+    # Ensure nested sections exist and have critical defaults
+    if not hasattr(cfg, "training") or cfg.training is None:
+        cfg.training = SimpleNamespace()
+    if isinstance(cfg.training, dict):
+        cfg.training = SimpleNamespace(**cfg.training)
+
+    # Core defaults
+    if not hasattr(cfg.training, "epochs"):
+        cfg.training.epochs = 10
+    if not hasattr(cfg.training, "batch_size"):
+        cfg.training.batch_size = 128
+    if not hasattr(cfg.training, "num_workers"):
+        cfg.training.num_workers = 4
+    if not hasattr(cfg.training, "seed"):
+        cfg.training.seed = 42
+    if not hasattr(cfg.training, "device"):
+        cfg.training.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if not hasattr(cfg.training, "amp"):
+        cfg.training.amp = True
+
+    # Reasonable optimizer defaults; cnn9_plain gets CIFAR-grade SGD by default
+    if not hasattr(cfg.training, "optimizer"):
+        cfg.training.optimizer = "sgd" if cfg.model == "cnn9_plain" else "adamw"
+    if not hasattr(cfg.training, "lr"):
+        cfg.training.lr = 0.1 if cfg.model == "cnn9_plain" else 1e-3
+    if not hasattr(cfg.training, "momentum"):
+        cfg.training.momentum = 0.9
+    if not hasattr(cfg.training, "weight_decay"):
+        cfg.training.weight_decay = 5e-4 if cfg.model == "cnn9_plain" else 1e-2
+    if not hasattr(cfg.training, "scheduler"):
+        cfg.training.scheduler = {"name": "step", "milestones": [100, 150], "gamma": 0.1}
+    if not hasattr(cfg.training, "label_smoothing"):
+        cfg.training.label_smoothing = 0.0
+
+    # Logging defaults
+    if not hasattr(cfg, "logging") or cfg.logging is None:
+        cfg.logging = SimpleNamespace()
+    if isinstance(cfg.logging, dict):
+        cfg.logging = SimpleNamespace(**cfg.logging)
+    if not hasattr(cfg.logging, "output_dir"):
+        cfg.logging.output_dir = "runs"
+    if not hasattr(cfg.logging, "run_name"):
+        cfg.logging.run_name = "exp"
+    if not hasattr(cfg.logging, "log_interval"):
+        cfg.logging.log_interval = 100
+    if not hasattr(cfg.logging, "save_checkpoints"):
+        cfg.logging.save_checkpoints = True
+    if not hasattr(cfg.logging, "wandb_enabled"):
+        cfg.logging.wandb_enabled = False
+    if not hasattr(cfg.logging, "wandb_project"):
+        cfg.logging.wandb_project = "nonlinear-mlp"
+
 
 def build_model(cfg: ExperimentConfig, input_dim=None, num_classes=None):
     if cfg.model == "mlp":
@@ -201,14 +268,13 @@ def build_model(cfg: ExperimentConfig, input_dim=None, num_classes=None):
             freeze_backbone=False
         )
     elif cfg.model == "cnn9_plain":
-        # Nonlinearity control via fixed.linear_ratio/pattern (remove ReLU at some convs)
+        # Nonlinearity control via fixed.linear_ratio/pattern (per-channel ReLU vs Identity)
         return PlainCNN9(
             num_classes=num_classes or cfg.num_classes,
             linear_ratio=getattr(cfg.fixed, "linear_ratio", 0.0),
             pattern=getattr(cfg.fixed, "pattern", "structured"),
         )
     elif cfg.model == "mlp_control":
-        # Control MLP: shrink widths structurally based on desired nonlinearity fraction
         if input_dim is None:
             raise ValueError("mlp_control requires input_dim for standalone MLPs.")
         return MLPControl(
@@ -222,34 +288,50 @@ def build_model(cfg: ExperimentConfig, input_dim=None, num_classes=None):
     else:
         raise ValueError(f"Unknown model {cfg.model}")
 
+
 def get_data(cfg: ExperimentConfig):
+    # Use num_workers if provided
+    bs = getattr(cfg.training, "batch_size", 128)
+    nw = getattr(cfg.training, "num_workers", 4)
+
     if cfg.dataset == "mnist":
-        train_loader, test_loader = get_mnist_loaders(batch_size=cfg.training.batch_size)
-        input_dim = 28*28
+        train_loader, test_loader = get_mnist_loaders(batch_size=bs)
+        input_dim = 28 * 28
         num_classes = 10
+
     elif cfg.dataset == "cifar10":
-        train_loader, test_loader = get_cifar10_loaders(batch_size=cfg.training.batch_size)
+        train_loader, test_loader = get_cifar10_loaders(batch_size=bs, num_workers=nw)
         input_dim = None
         num_classes = 10
+
     elif cfg.dataset == "cifar100":
-        train_loader, test_loader = get_cifar100_loaders(batch_size=cfg.training.batch_size)
+        train_loader, test_loader = get_cifar100_loaders(batch_size=bs, num_workers=nw)
         input_dim = None
         num_classes = 100
+
     elif cfg.dataset == "imagenet":
         if not IMAGENET_AVAILABLE:
             raise RuntimeError("Imagenet dataset loader not available. Ensure imagenet.py exists.")
+        # Allow override via cfg.data.imagenet_root if user provided a config; default to data/imagenet
+        root = "data/imagenet"
+        if hasattr(cfg, "data"):
+            root = getattr(cfg.data, "imagenet_root", root) if not isinstance(cfg.data, dict) else cfg.data.get("imagenet_root", root)
         train_loader, test_loader, num_classes = get_imagenet_loaders(
-            root="data/imagenet",
-            batch_size=cfg.training.batch_size
+            root=root,
+            batch_size=bs
         )
         input_dim = None
+
     elif cfg.dataset == "tabular_adult":
-        train_loader, test_loader, in_dim, n_classes = load_adult(batch_size=cfg.training.batch_size)
+        train_loader, test_loader, in_dim, n_classes = load_adult(batch_size=bs)
         input_dim = in_dim
         num_classes = n_classes
+
     else:
         raise ValueError(f"Unsupported dataset {cfg.dataset}")
+
     return train_loader, test_loader, input_dim, num_classes
+
 
 # =========================
 # Per-step training loop (inside this module)
@@ -264,10 +346,10 @@ def _train_one_epoch_step_logging(
     cfg: ExperimentConfig,
     log_interval: int,
     wb,                  # wandb context dict from _maybe_init_wandb
-    global_step: int     # global step counter carried across epochs
+    global_step: int,    # global step counter carried across epochs
+    criterion: nn.Module # injected to support label smoothing etc.
 ):
     model.train()
-    criterion = nn.CrossEntropyLoss()
 
     running_loss = 0.0
     running_acc = 0.0
@@ -341,6 +423,7 @@ def _train_one_epoch_step_logging(
     }
     return train_stats, global_step
 
+
 # =========================
 # Main
 # =========================
@@ -410,39 +493,21 @@ def main():
         if args.wandb_mode:
             cfg.logging.wandb_mode = args.wandb_mode
 
+    # Ensure defaults for training/logging/device
+    _ensure_training_defaults(cfg)
+
     # Seed & device
-    random.seed(cfg.training.seed)
-    np.random.seed(cfg.training.seed)
-    torch.manual_seed(cfg.training.seed)
+    set_seed(cfg.training.seed)
     device = cfg.training.device if torch.cuda.is_available() else "cpu"
 
     # Data & model
     train_loader, test_loader, input_dim, num_classes = get_data(cfg)
     model = build_model(cfg, input_dim=input_dim, num_classes=num_classes).to(device)
 
-    # Optimizer selection
-    # - For cnn9_plain: default to SGD with CIFAR-10 recipe unless cfg overrides
-    # - Else: default AdamW (existing behavior)
-    use_sgd = (cfg.model == "cnn9_plain")
-    opt_name = getattr(cfg.training, "optimizer", "sgd" if use_sgd else "adamw").lower()
-    if opt_name == "sgd":
-        lr = getattr(cfg.training, "lr", 0.1 if use_sgd else 1e-3)
-        momentum = getattr(cfg.training, "momentum", 0.9 if use_sgd else 0.9)
-        weight_decay = getattr(cfg.training, "weight_decay", 5e-4 if use_sgd else 1e-2)
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=False)
-        # Classic CIFAR-10 schedule
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer,
-            milestones=getattr(cfg.training, "milestones", [100, 150]),
-            gamma=getattr(cfg.training, "gamma", 0.1)
-        )
-    else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=getattr(cfg.training, "lr", 1e-3),
-            weight_decay=getattr(cfg.training, "weight_decay", 1e-2)
-        )
-        scheduler = None
+    # Optimizer & scheduler (CIFAR-grade defaults for cnn9_plain; else honor cfg)
+    optimizer, scheduler = build_optimizer_and_scheduler(model, cfg)
+    # CE with optional label_smoothing
+    criterion = cross_entropy_loss(cfg)
 
     # Modern AMP scaler (fallback to legacy if needed)
     try:
@@ -451,7 +516,7 @@ def main():
         from torch.cuda.amp import GradScaler as _LegacyGradScaler
         scaler = _LegacyGradScaler() if (device.startswith("cuda") and getattr(cfg.training, "amp", True)) else None
 
-    out_dir = f"{cfg.logging.output_dir}/{cfg.logging.run_name}"
+    out_dir = os.path.join(cfg.logging.output_dir, cfg.logging.run_name)
     os.makedirs(out_dir, exist_ok=True)
 
     # Initialize W&B (per-run dir under runs/<run_name>/wandb)
@@ -483,6 +548,7 @@ def main():
             log_interval=cfg.logging.log_interval,
             wb=wb,
             global_step=global_step,
+            criterion=criterion,
         )
 
         val_stats = evaluate(model, test_loader, device, cfg)
@@ -500,14 +566,14 @@ def main():
                 save_checkpoint(model, optimizer, cfg, epoch, record, out_dir)
         else:
             patience_counter += 1
-            if cfg.training.early_stop_patience and patience_counter >= cfg.training.early_stop_patience:
+            if getattr(cfg.training, "early_stop_patience", 0) and patience_counter >= cfg.training.early_stop_patience:
                 print("Early stopping triggered.")
                 break
 
         if scheduler is not None:
             scheduler.step()
 
-    # Post-training gating harden (if applicable to other models)
+    # Post-training gating harden (if applicable)
     if cfg.approach == "gating" and hasattr(model, "harden_gates"):
         print("Hardening gates...")
         model.harden_gates(threshold=cfg.gating.hard_threshold)
@@ -517,7 +583,7 @@ def main():
         if wb.get("enabled", False):
             wb["wandb"].log({"val/acc_hardened": hardened_eval.get("val_acc")})
 
-    # Post-training pruning (head/MLP models benefit most; CNN9 here is behaviorally linear only)
+    # Post-training pruning
     if cfg.pruning.enabled:
         print("Collecting activation stats for pruning...")
         tracker = ActivationTracker(max_batches=50)
@@ -543,6 +609,7 @@ def main():
                 log_interval=cfg.logging.log_interval,
                 wb=wb,
                 global_step=global_step,
+                criterion=criterion,
             )
         prune_eval = evaluate(model, test_loader, device, cfg)
         print("Prune evaluation:", prune_eval)
@@ -563,6 +630,7 @@ def main():
     print("Experiment complete. Results saved.")
 
     _wandb_finish(wb)
+
 
 if __name__ == "__main__":
     main()
