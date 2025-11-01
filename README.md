@@ -1,129 +1,229 @@
-# Nonlinear-MLP Experimentation Guide
+# Nonlinear-MLP Experimentation Guide (Updated)
 
 A complete, practical guide for running, extending, and interpreting experiments to answer the core research questions:
 
-> 1. How much nonlinearity is actually necessary?  
-> 2. Does this hold across architectures (MLPs, CNN heads, tabular MLPs, Transformer FFNs)?  
-> 3. What is the performance vs efficiency trade-off?  
-> 4. Which neurons should be linear vs nonlinear (random vs structured vs learned)?  
+> 1) How much nonlinearity is actually necessary?  
+> 2) Does this hold across architectures (MLPs, CNNs, ResNet heads, tabular MLPs)?  
+> 3) What is the performance vs efficiency trade-off?  
+> 4) Which neurons should be linear vs nonlinear (random vs structured vs learned)?  
 
 This document tells you:
-- Exactly how to start each task.
-- What to look for in logs and outputs.
+- Exactly how to start each task and sweeps (MNIST, CIFAR-10/100, ImageNet).
+- What to look for in logs and outputs beyond W&B charts.
 - How to interpret gating and activation statistics.
-- How to build evidence for each primary question.
-- How to scale from MNIST → CIFAR-10 → Tabular → ImageNet → Transformers.
+- How to run the analysis pipeline over runs/ and produce ablations.
+- How to add “control” models that structurally reduce neurons to match effective nonlinearity.
 
 ---
 
-## 1. Repository Structure (Key Directories)
+## 1) Repository Structure (Key Additions)
 
 | Path | Purpose |
 |------|---------|
 | `nonlinear_mlp/config.py` | Experiment configuration dataclasses. |
-| `nonlinear_mlp/layers/` | Mixed (fixed ratio) and gated activation modules. |
-| `nonlinear_mlp/models/` | MLP, ResNet head wrappers, (optionally Transformers). |
-| `nonlinear_mlp/data/` | Dataset loaders (MNIST, CIFAR-10, Adult, ImageNet). |
-| `nonlinear_mlp/analysis/activation_stats.py` | Collect activation statistics (for pruning / interpretability). |
+| `nonlinear_mlp/layers/mixed.py` | Fixed per-neuron Identity vs ReLU (MLP blocks). |
+| `nonlinear_mlp/layers/gated.py` | Gated per-neuron α between Identity/ReLU (MLP blocks). |
+| `nonlinear_mlp/layers/nl_dropout_layer.py` | Deterministic per-neuron zeroing (new “nl_dropout”). |
+| `nonlinear_mlp/layers/mixed2d.py` | Channel-wise Identity vs ReLU for Conv2d (CNN control). |
+| `nonlinear_mlp/models/mlp.py` | MLP with approaches: fixed, gating, nl_dropout. |
+| `nonlinear_mlp/models/mlp_control.py` | Control MLP that structurally reduces layer widths (new). |
+| `nonlinear_mlp/models/cnn_plain.py` | 9-layer plain CNN with channel-wise nonlinearity control (new). |
+| `nonlinear_mlp/models/cifar_head.py` | ResNet-18 + MLP head wrapper. |
+| `nonlinear_mlp/models/resnet50_head.py` | ResNet-50 + MLP head wrapper (optional if present). |
+| `nonlinear_mlp/data/mnist.py` | MNIST loaders. |
+| `nonlinear_mlp/data/cifar10.py` | CIFAR-10 loaders. |
+| `nonlinear_mlp/data/cifar100.py` | CIFAR-100 loaders (new). |
+| `nonlinear_mlp/data/imagenet.py` | ImageNet loaders via ImageFolder (new). |
+| `nonlinear_mlp/experiments/run_experiment.py` | Unified CLI runner, per-step W&B logging, pruning hooks. |
+| `nonlinear_mlp/analysis/activation_stats.py` | Robust activation tracker (Linear and optional Conv). |
+| `nonlinear_mlp/analysis/collect_runs.py` | Consolidate runs/* into a single CSV. |
+| `nonlinear_mlp/analysis/ablation.py` | Ablation plots (accuracy vs nonlinearity, Pareto, gaps). |
+| `nonlinear_mlp/analysis/evaluate_run.py` | Re-evaluate checkpoints (ACC, NLL, ECE; supports MLP flattening). |
+| `nonlinear_mlp/analysis/merge_analysis_tables.py` | Merge summary.csv with extra_eval.csv. |
 | `nonlinear_mlp/pruning/post_training.py` | Heuristics to linearize/prune layers post-training. |
-| `nonlinear_mlp/utils/metrics.py` | Accuracy and latency measurement utilities. |
-| `nonlinear_mlp/experiments/run_experiment.py` | Unified CLI runner for all models/datasets. |
-| `nonlinear_mlp/scripts/` | Predefined sweeps (MNIST ratio sweep, layerwise ablation). |
-| `nonlinear_mlp/notebooks/nonlinearity_analysis.ipynb` | Central analysis & visualization notebook. |
-| `runs/<run_name>/` | Output directory per experiment (history, metadata, checkpoints). |
+| `nonlinear_mlp/utils/metrics.py` | Accuracy, latency, throughput; safe MLP flattening in latency. |
+| `nonlinear_mlp/scripts/run_mnist_sweep.py` | MNIST fixed ratio sweep. |
+| `nonlinear_mlp/scripts/run_mnist_nldropout.py` | MNIST deterministic zeroing sweep (new). |
+| `nonlinear_mlp/scripts/run_mnist_mlp_control_sweep.py` | Control MLP sweep (structural width) (new). |
+| `nonlinear_mlp/scripts/run_cifar_cnn9_sweep.py` | CIFAR-10 9-layer CNN channel-wise sweep (new). |
+| `nonlinear_mlp/scripts/run_cifar100_sweep.py` | CIFAR-100 ResNet18-head sweep (new). |
+| `nonlinear_mlp/scripts/run_imagenet_head_baseline.py` | ImageNet head baseline runner (new). |
+| `nonlinear_mlp/scripts/evaluate_all_runs.py` | Batch evaluate every run (ACC/NLL/ECE) (new). |
+| `runs/<run_name>/` | Output per experiment: history.json, meta.json, checkpoints, extra_eval.json. |
 
 ---
 
-## 2. Installation & Environment
+## 2) Installation & Environment
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate            # (Linux/macOS)
-# or .venv\Scripts\activate          # (Windows)
+source .venv/bin/activate            # Linux/macOS
+# .venv\Scripts\activate             # Windows
 
 pip install -r requirements.txt
+# torchvision/torchaudio should match your CUDA/PyTorch install
 
-# Optional for Transformers experiments:
-pip install transformers accelerate tokenizers
+# Optional (Transformers later):
+# pip install transformers accelerate tokenizers
 ```
 
-**GPU Check:**
+GPU check:
 ```bash
-python -c "import torch; print(torch.cuda.is_available())"
+python -c "import torch; print(torch.cuda.is_available()); import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
 ```
 
 ---
 
-## 3. Core Concepts
+## 3) Core Concepts (Updated)
 
 | Concept | Meaning | Why It Matters |
 |---------|--------|----------------|
-| Linear ratio | Fraction of hidden neurons that skip ReLU (identity) | Direct axis for "minimum nonlinearity" investigation |
-| Approach 1 | Fixed ratio (structured / random / alternating) | Baseline control of nonlinearity |
-| Approach 2 | Learned gating (alpha blend) | Lets network *discover* required nonlinearity |
-| Approach 3 | Post-training pruning / linearization | Derive minimal nonlinear set after a standard train |
-| Approach 4 | Train from scratch with mixed activations | End-to-end optimization under hybrid structure |
-| Approach 5 | Layer-wise adaptation schedule | Tests if different layers need different nonlinear density |
-| Activation stats | Fraction positive / negative + nonlinear contribution | Diagnostic for where ReLU actually changes outputs |
-| Gating alphas | Learned per-layer (or per-neuron) nonlinearity weights | Interpret what the model deems necessary |
-| Harden phase | Converts soft gating into discrete identity/ReLU behavior | Stabilizes final evaluation state |
+| Linear ratio | Fraction of hidden units that bypass ReLU (Identity) | Primary axis for “minimum nonlinearity”. |
+| fixed (MLP) | Per-neuron deterministic mix via MixedActivationLayer | Baseline nonlinearity control. |
+| gating (MLP) | Learn α per neuron (Identity↔ReLU), harden later | Lets model discover needed nonlinearity. |
+| nl_dropout (MLP) | Deterministic per-neuron zeroing of N% (new) | Control variant: remove neurons by output=0. |
+| control MLP | Structurally reduce layer width to match nonlinear fraction (new) | Parameter-matched control against “fixed” runs. |
+| CNN channel-wise | Per-channel Identity vs ReLU after each Conv (new) | Neuron-like control in CNNs. |
+| Activation stats | positive/negative fractions + nonlinear_score | Diagnostics for where ReLU actually changes outputs. |
+| Pruning | Decide post-hoc linearization using activation stats | Validate necessity of nonlinearity ex-post. |
+| Per-step W&B | Log loss/acc per batch, epoch aggregates | Inspect convergence and stability. |
+
+Datasets supported: MNIST, CIFAR-10, CIFAR-100 (new), ImageNet (new), Adult tabular.
 
 ---
 
-## 4. Quick Start (Task 1 – MNIST MLP)
+## 4) Quick Starts
 
-### 4.1 Baseline ReLU
+### 4.1 MNIST MLP (fixed)
+
+Baseline ReLU:
 ```bash
 python -m nonlinear_mlp.experiments.run_experiment \
   --dataset mnist --model mlp --approach fixed \
-  --linear_ratio 0.0 --epochs 10 --run_name mnist_relu_baseline
+  --linear_ratio 0.0 --epochs 20 --run_name mnist_fixed_0 --wandb --wandb_project nonlinear-mlp
 ```
 
-### 4.2 Sweep Linear Ratios
-Use included script (adjust epochs if needed):
+Sweep (0,25,50,75,100):
 ```bash
 python nonlinear_mlp/scripts/run_mnist_sweep.py
 ```
-Generates runs like:
-```
-runs/
-  mnist_fixed_0/
-  mnist_fixed_25/
-  mnist_fixed_50/
-  ...
-```
 
-### 4.3 Gating Run
+### 4.2 MNIST MLP (gating)
+
 ```bash
 python -m nonlinear_mlp.experiments.run_experiment \
   --dataset mnist --model mlp --gating \
-  --epochs 12 --run_name mnist_gating
+  --epochs 20 --run_name mnist_gating --wandb --wandb_project nonlinear-mlp
 ```
 
-### 4.4 Analyze
-Open the notebook:
+### 4.3 MNIST MLP (deterministic zeroing, nl_dropout)
+
+- Exactly N% of neurons per hidden layer output 0 forever; rest use ReLU.
+- pattern=structured zeros last K per layer; pattern=random uses a fixed seed.
+
+Single run (50% zeroed):
+```bash
+python -m nonlinear_mlp.experiments.run_experiment \
+  --dataset mnist --model mlp --approach nl_dropout \
+  --linear_ratio 0.5 --pattern structured \
+  --epochs 20 --run_name mnist_mlp_nldropout_50 --wandb --wandb_project nonlinear-mlp
 ```
-jupyter notebook nonlinear_mlp/notebooks/nonlinearity_analysis.ipynb
+
+Sweep (0,25,50,75):
+```bash
+python -m nonlinear_mlp.scripts.run_mnist_nldropout --wandb_project nonlinear-mlp --mode online
 ```
-Look at:
-- Accuracy vs linear ratio curve.
-- Gating alpha evolution.
-- Generalization gap (train vs val).
-- Latency vs accuracy scatter.
+
+### 4.4 MNIST MLP (control, structural width reduction)
+
+- Keeps K% of hidden neurons structurally (layer widths reduced).
+- Map desired K% to `linear_ratio = 1 - K` to reuse config plumbing.
+
+Example (keep 50%):
+```bash
+python -m nonlinear_mlp.experiments.run_experiment \
+  --dataset mnist --model mlp_control \
+  --linear_ratio 0.5 --epochs 20 \
+  --run_name mnist_mlp_control_nonlin_50 --wandb --wandb_project nonlinear-mlp
+```
+
+Sweep:
+```bash
+python -m nonlinear_mlp.scripts.run_mnist_mlp_control_sweep --wandb_project nonlinear-mlp --mode online
+```
+
+### 4.5 CIFAR-10 (plain CNN-9, channel-wise nonlinearity)
+
+- 9 conv layers with ReLU-per-channel control (N% linear per conv).
+- Defaults: 200 epochs, SGD 0.1, mom 0.9, wd 5e-4, bs 128.
+
+Example (50% linear channels):
+```bash
+python -m nonlinear_mlp.experiments.run_experiment \
+  --dataset cifar10 --model cnn9_plain --approach fixed \
+  --linear_ratio 0.5 --pattern structured \
+  --epochs 200 --run_name cifar_cnn9_fixed_50 --wandb --wandb_project nonlinear-mlp
+```
+
+Sweep:
+```bash
+python -m nonlinear_mlp.scripts.run_cifar_cnn9_sweep --wandb_project nonlinear-mlp --mode online
+```
+
+### 4.6 CIFAR-10 (ResNet18 head)
+
+```bash
+python -m nonlinear_mlp.experiments.run_experiment \
+  --dataset cifar10 --model resnet18_head --approach fixed \
+  --linear_ratio 0.5 --epochs 60 --run_name cifar_head_fixed_50 --wandb --wandb_project nonlinear-mlp
+```
+
+### 4.7 CIFAR-100 (ResNet18 head)
+
+```bash
+python -m nonlinear_mlp.experiments.run_experiment \
+  --dataset cifar100 --model resnet18_head --approach fixed \
+  --linear_ratio 0.0 --epochs 100 --run_name cifar100_r18_baseline --wandb --wandb_project nonlinear-mlp
+```
+
+Sweep:
+```bash
+python -m nonlinear_mlp.scripts.run_cifar100_sweep --wandb_project nonlinear-mlp --mode online
+```
+
+### 4.8 ImageNet (ResNet head baseline)
+
+- Expects `data/imagenet/{train,val}/class/*`.
+- Defaults: 224px crops; adjust root via a config if needed.
+
+```bash
+python -m nonlinear_mlp.scripts.run_imagenet_head_baseline \
+  --model resnet18_head --epochs 90 --wandb_project nonlinear-mlp --mode online
+```
 
 ---
 
-## 5. Run Directory Artifacts
+## 5) W&B Logging (Per-step + Per-epoch)
 
-Each experiment creates:
+- runner (`experiments/run_experiment.py`) logs:
+  - Per-step: loss, acc, reg, batch size, lr.
+  - Per-epoch: train/val metrics, timings.
+  - Summary: params, throughput/latency, approx flops, memory.
+- Enable with `--wandb --wandb_project <name>` (+ optional entity, group, tags).
+
+---
+
+## 6) Run Artifacts
+
+Each run writes:
 ```
 runs/<run_name>/history.json
 runs/<run_name>/meta.json
-runs/<run_name>/checkpoint_<epoch>.pt (if enabled)
+runs/<run_name>/checkpoint_<epoch>.pt (if save_checkpoints)
+runs/<run_name>/extra_eval.json (after evaluation step)
 ```
 
-### 5.1 `history.json`
-Array of epoch records:
+### history.json (epoch array)
 ```json
 {
   "epoch": 10,
@@ -132,370 +232,241 @@ Array of epoch records:
   "val_loss": ...,
   "val_acc": ...,
   "gating": [
-     {"layer": 0, "alpha_mean": 0.73, "alpha_lt_0.1": 0.05, ...},
-     ...
+    {"layer": 0, "alpha_mean": 0.73, "alpha_lt_0.1": 0.05, ...}, ...
   ]
 }
 ```
-Special entries:
-- `"epoch": "hardened"` – after gating thresholding.
-- `"epoch": "post_prune"` – after pruning fine-tune (if used).
+Special rows:
+- `"epoch": "hardened"` after gating harden.
+- `"epoch": "post_prune"` after pruning fine-tune.
 
-### 5.2 `meta.json`
-Contains:
+### meta.json
 ```json
 {
   "param_counts": {"total_params": ..., "trainable_params": ...},
   "approx_linear_flops": ...,
   "latency": {
-     "mean_latency_s": ...,
-     "p50_latency_s": ...,
-     "samples_per_second": ...,
-     ...
+    "mean_latency_s": ...,
+    "p50_latency_s": ...,
+    "samples_per_second": ...
   },
   "memory_mb": ...,
-  "config": { ... full config blob ... }
+  "config": { ...full config blob... }
 }
 ```
 
 ---
 
-## 6. How to Answer the Primary Questions
+## 7) Analysis Pipeline (from runs/)
 
-### Q1: “How much nonlinearity is actually necessary?”
-Steps:
-1. Generate accuracy vs linear ratio plot (MNIST first).
-2. Identify smallest ratio with < target accuracy drop (e.g. <1–2% absolute).
-3. For gating runs, compute effective linear ratio: `1 - mean_alpha` and evaluate accuracy.
-4. Report threshold (e.g., “50% linear retains 98% of baseline accuracy”).
+1) Collect all runs into one CSV:
+```bash
+python -m nonlinear_mlp.analysis.collect_runs --runs_dir runs
+# -> runs/_analysis/summary.csv
+```
 
-Artifacts:
-- Notebook: “Accuracy vs Linear Neuron Ratio”
-- `summary_df` (`analysis_summary.csv` after saving from notebook)
-- Gating alpha histogram / distribution table
+2) Evaluate all checkpoints for ACC/NLL/ECE (clean & noisy):
+```bash
+python -m nonlinear_mlp.scripts.evaluate_all_runs --runs_dir runs --noise_std 0.1 --force
+# -> runs/<run>/extra_eval.json and runs/_analysis/extra_eval.csv
+```
+Notes:
+- Evaluator auto-flattens images for MLPs.
+- Robust to dict configs via namespace wrapping.
 
-Metrics to extract:
-- `val_acc` at each ratio
-- `linear_ratio_est` (fixed or inferred)
-- Possibly plot “delta accuracy vs ratio” for clarity.
+3) Merge tables:
+```bash
+python -m nonlinear_mlp.analysis.merge_analysis_tables --runs_dir runs
+# -> runs/_analysis/summary_merged.csv
+```
 
-### Q2: “Does this work across architectures?”
-Do same process for:
-- MNIST MLP → Foundational
-- CIFAR ResNet-18 head → Vision mid-scale
-- Tabular Adult → Non-vision
-- (Later) ImageNet ResNet-50 head → Large-scale
-- (Later) Transformers (BERT FFN gating) → NLP
+4) Plot ablations:
+```bash
+python -m nonlinear_mlp.analysis.ablation --runs_dir runs
+# -> runs/_analysis/figures/*.png
+```
 
-Compare curves:
-- Normalize performance drop at 25%, 50%, 75% linear vs baseline.
-- Summarize in a table:
-
-| Architecture | 25% Linear Drop | 50% Linear Drop | 75% Linear Drop | Gated Effective Ratio |
-|--------------|-----------------|-----------------|-----------------|-----------------------|
-
-### Q3: “Performance vs Efficiency trade-off?”
-Gather:
-- `val_acc` (accuracy)
-- `latency.mean_latency_s`
-- `samples_per_second`
-- Optionally param counts (same) & theoretical `approx_linear_flops`
-
-Plot:
-- Latency vs Accuracy (Pareto frontier)
-- Accuracy vs Mean Latency (annotated with ratio)
-- Efficiency metric: `accuracy / latency` ranking
-
-Interpretation:
-- Identify sweet spot where marginal accuracy loss buys disproportionate latency gain.
-
-### Q4: “Which neurons should be linear vs nonlinear?”
-Approaches:
-1. Fixed structured vs random vs alternating → Compare accuracy variance.
-2. Gating alpha distribution:
-   - Examine `alpha_lt_0.1` fraction per layer over epochs.
-   - Identify if early or late layers trend toward linear.
-3. Activation stats (Approach 3):
-   - Positive fraction close to 1.0 means ReLU ineffective → linear candidate.
-   - “Nonlinear contribution” score low (<0.05) → safe linearization.
-4. Pruning decisions:
-   - Count layers flagged for linearization in decisions object.
-   - Evaluate effect on accuracy before & after fine-tuning.
-
-Report:
-- Layer-by-layer table with columns: `layer_idx | pos_frac | nonlinear_score | gating_alpha_mean | linearized?`
+Figures produced:
+- `acc_vs_nonlin.png` — accuracy vs effective nonlinearity (all models).
+- `pareto_acc_latency.png` — accuracy vs throughput/latency.
+- `train_val_gap.png` — generalization gap vs nonlinearity.
+- `gating_soft_vs_hardened.png` — soft vs hardened (if present).
 
 ---
 
-## 7. Secondary Question Workflows
+## 8) Activation Statistics (Improved)
 
-| Question | Evidence / Procedure |
-|----------|---------------------|
-| Does optimal ratio change across layers? | Use layerwise schedule + gating alpha stats. Plot alpha_mean vs layer. |
-| Dependence on dataset complexity? | Compare threshold ratio across MNIST vs CIFAR vs ImageNet subset vs Tabular. |
-| Generalization insight | Compare generalization gap vs ratio (does reducing nonlinearity regularize?). |
-| Training dynamics | Plot convergence speed (# epochs to reach X% baseline). |
-| Robustness (future) | Add adversarial eval (FGSM / PGD) for different ratios. |
+`analysis/activation_stats.py`:
+- Hooks `nn.Linear` as `linear_0, linear_1, ...` (stable naming).
+- Optional `include_conv=True` to hook `nn.Conv2d` (`conv_0..`).
+- Metrics:
+  - `positive_frac` = fraction z>0 (low clipping → identity candidate).
+  - `negative_frac` = fraction z<0 (dead-ish).
+  - `nonlinear_score` = E[|min(0,z)| / (|z| + eps)] (how much ReLU truncates).
+- Safe image flattening for MLPs during stats pass.
 
----
-
-## 8. Experimental Task Guide
-
-### Task 1 (MNIST)
-Goal: Rapid sensitivity check.
-- Run ratio sweep + gating.
-- Target: 50% linear ≤ 1–3% accuracy loss.
-
-### Task 2 (CIFAR-10 ResNet-18 Head)
-Goal: Confirm idea in harder visuals.
-- Start with baseline (0% linear).
-- Try 25/50/75%.
-- Add gating and pruning run.
-- Compare inference latency (note: head-only speedup modest).
-
-### Task 3 (Tabular)
-Goal: Generalization beyond vision.
-- Use best approach (gating or fixed 50%).
-- Compare ratio threshold shift vs vision.
-
-### Task 4 (ImageNet Subset/full)
-Goal: Scale evidence.
-- Use gating on ResNet-50 head.
-- Add top-5 accuracy metric (modify evaluate).
-- Evaluate cost-benefit at 25–50% linear in head.
-
-### Task 5 (Transformers)
-Goal: NLP domain validation.
-- Patch FFN intermediate with gating/mixed module.
-- Fine-tune on a small GLUE task (e.g., SST-2).
-- Track alpha collapse per layer (are higher layers more linear?).
-
-### Task 6 (Ablations)
-Goal: Mechanistic understanding.
-- Layerwise ratio schedules: low→high, high→low, uniform.
-- Compare gating vs fixed with same effective ratio.
-- Try pruning after gating vs pruning after pure ReLU training.
-
----
-
-## 9. Interpreting Gating (Approach 2)
-
-| Metric | Insight |
-|--------|---------|
-| `alpha_mean` ↓ | Layer becoming more linear overall. |
-| `alpha_lt_0.1` ↑ | Large chunk of neurons act linear. |
-| `alpha_gt_0.9` stable | Core nonlinear subset persistent. |
-| Shift early vs late | Structural / representational economy differences. |
-
-**Decision:** If a layer’s `alpha_mean < 0.3` across final epochs → candidate for forced linearization in future architecture simplification.
-
----
-
-## 10. Activation Stats (Approach 3)
-
-Collected statistics per `Linear`:
-- `positive_frac`: If >0.95, ReLU rarely clips → identity safe.
-- `negative_frac`: If >0.95, neuron outputs near zero → “dead.”
-- `nonlinear_score`: Mean fraction of magnitude below zero (ReLU-suppressed region). Lower means minimal nonlinear action.
-
-Heuristic thresholds (tune with pilot):
+Heuristic thresholds (tune empirically):
 | Feature | Threshold | Action |
 |---------|-----------|--------|
 | positive_frac > 0.95 & nonlinear_score < 0.05 | Mark linear |
-| negative_frac > 0.95 | Consider pruning or ignoring |
+| negative_frac > 0.95 | Consider pruning neuron |
 | nonlinear_score > 0.2 | Likely influential nonlinearity |
 
 ---
 
-## 11. Layerwise Schedule Exploration
+## 9) Models & Approaches (What they do)
 
-Use JSON config:
-```json
-{
-  "dataset": "mnist",
-  "approach": "layerwise",
-  "fixed": { "linear_ratio": 0.5, "pattern": "structured" },
-  "layerwise": {
-    "enabled": true,
-    "schedule": { "0": 0.2, "1": 0.5, "2": 0.8 }
-  },
-  "training": { "epochs": 12 },
-  "logging": { "run_name": "mnist_layerwise_gradient" }
-}
-```
-Run:
+- MLP (fixed): per-neuron identity vs ReLU via MixedActivationLayer.
+- MLP (gating): per-neuron learnable α; supports `harden_gates(threshold)`.
+- MLP (nl_dropout): deterministically zero N% per layer outputs, keep ReLU for the rest.
+- MLP (control): shrink widths to match desired nonlinearity fraction structurally.
+- CNN-9 (channel-wise): per-channel identity vs ReLU masks after each conv.
+- ResNet heads: standard backbones + MLP head with nonlinearity in head.
+
+---
+
+## 10) Sweeps (Scripts Catalog)
+
+- MNIST fixed: `nonlinear_mlp/scripts/run_mnist_sweep.py`
+- MNIST nl_dropout: `nonlinear_mlp/scripts/run_mnist_nldropout.py`
+- MNIST control (structural): `nonlinear_mlp/scripts/run_mnist_mlp_control_sweep.py`
+- CIFAR-10 CNN-9 channel-wise: `nonlinear_mlp/scripts/run_cifar_cnn9_sweep.py`
+- CIFAR-100 ResNet18 head: `nonlinear_mlp/scripts/run_cifar100_sweep.py`
+- ImageNet head baseline: `nonlinear_mlp/scripts/run_imagenet_head_baseline.py`
+- Batch evaluate all runs: `nonlinear_mlp/scripts/evaluate_all_runs.py`
+
+All scripts are idempotent: they skip when `runs/<run_name>/meta.json` exists (toggle with `--no_skip_existing` where supported).
+
+---
+
+## 11) Interpreting Gating
+
+| Metric | Insight |
+|--------|---------|
+| `alpha_mean` ↓ | Layer trending more linear. |
+| `alpha_lt_0.1` ↑ | Large fraction near identity behavior. |
+| `alpha_gt_0.9` stable | Persistent nonlinear core. |
+| Layerwise shifts | Early vs late layer nonlinearity demand. |
+
+Rule of thumb: if final `alpha_mean < 0.3` consistently → candidate for forced linearization or structural reduction.
+
+---
+
+## 12) Performance vs Efficiency (What to plot)
+
+- Accuracy vs effective nonlinearity fraction (all models).
+- Pareto: Accuracy vs throughput (or inverse latency).
+- Train−Val gap vs nonlinearity (implicit regularization).
+- Gating soft vs hardened (stability of discrete assignment).
+
+Use:
 ```bash
-python -m nonlinear_mlp.experiments.run_experiment --config config.json
+python -m nonlinear_mlp.analysis.collect_runs --runs_dir runs
+python -m nonlinear_mlp.analysis.ablation --runs_dir runs
 ```
 
-Plot (in notebook) accuracy vs (average ratio) and inspect per-layer gating alphas (if gating approach used).
+---
+
+## 13) Dataset Notes
+
+- MNIST: flattens to 784 for MLPs (auto-handled in training & eval).
+- CIFAR-10/100: std aug (crop+flip) and normalization; channel-wise CNN experiment for CIFAR-10.
+- ImageNet: folder layout `data/imagenet/train|val`; std 224 crops and normalization.
 
 ---
 
-## 12. Metrics Reference
+## 14) Troubleshooting
 
-| Metric | File Source | Meaning | Use |
-|--------|-------------|---------|-----|
-| `train_acc` / `val_acc` | `history.json` | Performance | Primary axis |
-| `train_loss` / `val_loss` | `history.json` | Convergence / overfit gap | Generalization analysis |
-| `gating.alpha_mean` | `history.json` | Nonlinearity density per layer | Approach 2 insights |
-| `latency.mean_latency_s` | `meta.json` | Wall-clock per batch | Efficiency |
-| `samples_per_second` | `meta.json` | Throughput | Practical speed |
-| `approx_linear_flops` | `meta.json` | Theoretical linear-layer FLOPs | Rough cost baseline |
-| `memory_mb` | `meta.json` | Host memory RSS | Resource footprint |
-| `param_counts.trainable_params` | `meta.json` | Model complexity | Cross-run normalization |
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| AttributeError on cfg.training.seed | Nested config stored as dict | Runner/evaluator coerce to namespaces; update files already included. |
+| mat1×mat2 shape error on MNIST eval | MLP received 4D tensor | Evaluator now flattens for MLP; ensure updated `evaluate_run.py`. |
+| No W&B logs | Missing flags or API key | Use `--wandb --wandb_project ...` and `wandb login` or set `WANDB_API_KEY`. |
+| ImageNet path error | Wrong root path | Use default `data/imagenet` structure or provide config with `data.imagenet_root`. |
+| CNN-9 poor accuracy at high linear ratios | Too few nonlinear channels | Try lower linear_ratio or selective layer schedules. |
 
 ---
 
-## 13. Building Your Final Report
+## 15) Estimated GPU Times (RTX 3090, rough)
 
-Structure suggestion:
+| Task | Setting | Est. Time per Run |
+|------|---------|--------------------|
+| MNIST MLP (fixed/nl_dropout/control) | 20 epochs, bs 128 | 0.3–1.5 min |
+| CIFAR-10 ResNet18 head | 60 epochs, bs 128 | 45–90 min |
+| CIFAR-10 CNN-9 channel-wise | 200 epochs, bs 128 | 30–60 min |
+| CIFAR-100 ResNet18 head | 100 epochs, bs 128 | 2–3 hrs |
+| ImageNet ResNet18 head | 90 epochs, 224px, bs 256 | 18–36 hrs |
+| Analysis (collect+ablation) | N/A | < 1 min for ~100 runs |
+| Evaluate all runs (ACC/NLL/ECE) | noise_std=0.1 | ~1–3 s per run |
 
-### 1. Executive Summary
-Short narrative: “We found that ~50% linear neurons retain ≥98% MNIST accuracy, ~50% yields <2% drop on CIFAR head…”
-
-### 2. Methods
-Outline Approaches 1–5 with diagrams (optional).
-
-### 3. Results
-- Accuracy vs Linear Ratio (plots per dataset)
-- Latency vs Accuracy (Pareto)
-- Gating Alpha Distributions (heatmaps)
-- Layerwise sensitivity
-
-### 4. Cross-Domain Consistency
-Table summarizing thresholds for MNIST / CIFAR / Tabular / ImageNet / BERT.
-
-### 5. Interpretation
-- Linear neurons handle pass-through & amplitude features.
-- Nonlinear subset concentrated in earlier or middle layers (if observed).
-
-### 6. Limitations
-- No real compute reduction yet (no sparse kernel).
-- Pruning heuristic coarse (layer-level).
-- Transformer gating scalar vs per-neuron (if not extended).
-
-### 7. Future Work
-- Per-neuron structural pruning.
-- Energy and robustness evaluation.
-- Adaptive ratio scheduling during training.
+Notes:
+- Times vary by aug, IO, cudnn bench, precision (AMP), and whether backbones are frozen.
+- For faster sanity checks: reduce epochs, use subsets, or increase batch size.
 
 ---
 
-## 14. Troubleshooting
-
-| Symptom | Possible Cause | Fix |
-|---------|----------------|-----|
-| Accuracy very low across all ratios | Data loader normalization mismatch | Check mean/std |
-| Gating alpha stays ~initial | Regularization too strong or lr too low | Reduce entropy/L1 or raise lr |
-| No latency difference | Head-only modification or GPU overhead dominates | Increase batch size or move linearization deeper |
-| Pruning causes large accuracy crash | Thresholds too aggressive | Relax positive_frac / nonlinear_score cutoffs |
-| Notebook errors on epoch | Post-prune/harden epochs are strings | Coerce or filter non-integer epochs |
-
----
-
-## 15. Extensions (Optional)
-
-| Extension | Description |
-|-----------|-------------|
-| Per-neuron pruning | Rebuild layers excluding “dead” units. |
-| Adaptive gating annealing | Lower temperature over epochs. |
-| Robustness tests | FGSM / PGD across ratios. |
-| Energy measurement | Log GPU power (poll `nvidia-smi`). |
-| Alpha clustering | Analyze if “important nonlinearity” forms functional groups. |
-| Mixed activation in attention projections | Extend beyond FFN to MHA linear projections. |
-
----
-
-## 16. Suggested Execution Order (Time-Efficient Path)
-
-1. MNIST sweep (establish curve shape).
-2. CIFAR-10 head fixed + gating runs.
-3. Add pruning pass to CIFAR results.
-4. Tabular (Adult) confirm portability.
-5. ImageNet subset (e.g., 50–100 classes) for scaling trend.
-6. Transformer FFN gating (SST-2).
-7. Layerwise ablations (only after gating insights).
-8. Compile cross-domain summary.
-
----
-
-## 17. Time Budget Guidance
-
-| Phase | Est. Time (GPU modest) |
-|-------|------------------------|
-| MNIST full sweep | 30–60 min |
-| CIFAR head 4–6 runs | 4–6 hrs |
-| Gating CIFAR (longer) | 4–8 hrs |
-| Tabular trio | 1–2 hrs |
-| ImageNet subset (10–20 epochs) | 1–2 days |
-| Transformer small GLUE | 4–8 hrs |
-| Ablations + analysis | Parallel / incremental |
-
----
-
-## 18. Minimal Commands Cheat Sheet
+## 16) Minimal Commands Cheat Sheet
 
 ```bash
-# Baseline
-python -m nonlinear_mlp.experiments.run_experiment --dataset mnist --model mlp --approach fixed --linear_ratio 0.0 --run_name mnist_relu
+# Baseline MNIST ReLU
+python -m nonlinear_mlp.experiments.run_experiment --dataset mnist --model mlp --approach fixed --linear_ratio 0.0 --epochs 20 --run_name mnist_fixed_0
 
-# 50% linear
-python -m nonlinear_mlp.experiments.run_experiment --dataset mnist --model mlp --approach fixed --linear_ratio 0.5 --run_name mnist_lin50
+# MNIST 50% linear (fixed)
+python -m nonlinear_mlp.experiments.run_experiment --dataset mnist --model mlp --approach fixed --linear_ratio 0.5 --epochs 20 --run_name mnist_fixed_50
 
-# Gating
-python -m nonlinear_mlp.experiments.run_experiment --dataset mnist --model mlp --gating --run_name mnist_gating
+# MNIST gating
+python -m nonlinear_mlp.experiments.run_experiment --dataset mnist --model mlp --gating --epochs 20 --run_name mnist_gating
 
-# CIFAR-10 head 50%
-python -m nonlinear_mlp.experiments.run_experiment --dataset cifar10 --model resnet18_head --approach fixed --linear_ratio 0.5 --epochs 60 --run_name cifar_head_50
+# MNIST deterministic zeroing (50%)
+python -m nonlinear_mlp.experiments.run_experiment --dataset mnist --model mlp --approach nl_dropout --linear_ratio 0.5 --epochs 20 --run_name mnist_mlp_nldropout_50
 
-# CIFAR-10 gating
-python -m nonlinear_mlp.experiments.run_experiment --dataset cifar10 --model resnet18_head --gating --epochs 60 --run_name cifar_head_gating
+# MNIST control model (keep 50% structurally)
+python -m nonlinear_mlp.experiments.run_experiment --dataset mnist --model mlp_control --linear_ratio 0.5 --epochs 20 --run_name mnist_mlp_control_nonlin_50
 
-# CIFAR-10 pruning (start all ReLU)
-python -m nonlinear_mlp.experiments.run_experiment --dataset cifar10 --model resnet18_head --approach fixed --linear_ratio 0.0 --pruning --epochs 60 --run_name cifar_head_prune
+# CIFAR-10 CNN-9 channel-wise (50% linear channels)
+python -m nonlinear_mlp.experiments.run_experiment --dataset cifar10 --model cnn9_plain --approach fixed --linear_ratio 0.5 --epochs 200 --run_name cifar_cnn9_fixed_50
 
-# Layerwise schedule example
-python -m nonlinear_mlp.experiments.run_experiment --config configs/mnist_layerwise.json --run_name mnist_layerwise_demo
+# CIFAR-10 ResNet18 head 50%
+python -m nonlinear_mlp.experiments.run_experiment --dataset cifar10 --model resnet18_head --approach fixed --linear_ratio 0.5 --epochs 60 --run_name cifar_head_fixed_50
+
+# CIFAR-100 ResNet18 head baseline
+python -m nonlinear_mlp.experiments.run_experiment --dataset cifar100 --model resnet18_head --approach fixed --linear_ratio 0.0 --epochs 100 --run_name cifar100_r18_baseline
+
+# ImageNet ResNet18 head baseline
+python -m nonlinear_mlp.scripts.run_imagenet_head_baseline --model resnet18_head --epochs 90
+
+# Collect + Ablation
+python -m nonlinear_mlp.analysis.collect_runs --runs_dir runs
+python -m nonlinear_mlp.analysis.ablation --runs_dir runs
+
+# Evaluate all + merge tables
+python -m nonlinear_mlp.scripts.evaluate_all_runs --runs_dir runs --noise_std 0.1 --force
+python -m nonlinear_mlp.analysis.merge_analysis_tables --runs_dir runs
 ```
 
 ---
 
-## 19. Final Checklist Before Claiming Findings
+## 17) Final Checklist (Before Claiming Findings)
 
 | Item | Verified? |
 |------|-----------|
 | Accuracy vs ratio curves stable across random seeds |
-| Gating alpha distributions converge (not random noise) |
-| Latency gains measured with consistent batch size |
-| Activation stats collected on representative data subset |
-| Layerwise behavior consistent across runs (not artifact) |
-| Report includes cross-domain comparative table |
-| Hardening step doesn’t cause unexpected accuracy collapse |
-| Pruning changes documented with before/after metrics |
+| Gating alpha distributions converge (not noise) |
+| Latency/throughput measured with consistent batch sizes |
+| Activation stats collected on representative subset |
+| Layerwise behavior consistent (not artifact) |
+| Cross-domain comparative table prepared (MNIST, CIFAR-10/100, ImageNet head) |
+| Harden step doesn’t collapse accuracy |
+| Control model comparisons included (parameter-matched) |
+| Analysis figures saved to `runs/_analysis/figures/` |
 
 ---
 
-## 20. Contact / Next Steps
+## 18) Next Steps / Extensions
 
-If you need:
-- A GLUE fine-tuning script,
-- Per-neuron pruning implementation,
-- Energy measurement integration,
-- Automated summary report generator,
+- Per-neuron pruning (structural) for MLP and per-channel for CNNs, to hard-match activation stats.
+- Energy logging via `nvidia-smi` polling for efficiency claims.
+- Robustness (FGSM/PGD) vs nonlinearity curves.
+- Transformer FFN gating experiments (SST-2), reusing gating/mixed modules.
 
-Request these incrementally to maintain clarity of experimental control.
-
----
-
-### TL;DR Flow
-
-1. Run MNIST sweep → see elbow.  
-2. Run CIFAR head fixed + gating → confirm elbow similar.  
-3. Run pruning → evaluate post-hoc linearization viability.  
-4. Expand to tabular + ImageNet head → cross-domain consistency.  
-5. Patch Transformer FFN → NLP confirmation.  
-6. Layerwise schedules + gating stats → mechanistic story.  
-7. Assemble report with accuracy/latency/gating/activation evidence.  
-
-Good experimenting!
+Happy experimenting!
