@@ -10,6 +10,7 @@ import torch.nn as nn
 from nonlinear_mlp.config import ExperimentConfig
 from nonlinear_mlp.data.mnist import get_mnist_loaders
 from nonlinear_mlp.data.cifar10 import get_cifar10_loaders
+from nonlinear_mlp.data.cifar100 import get_cifar100_loaders
 from nonlinear_mlp.data.tabular import load_adult
 from nonlinear_mlp.models.mlp import MLP
 from nonlinear_mlp.models.cifar_head import build_resnet18_with_mlp_head
